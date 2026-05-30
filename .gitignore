@@ -1,0 +1,21 @@
+# Dependency folders
+node_modules/
+
+# Build and compilation outputs
+dist/
+build/
+.turbo/
+*.tsbuildinfo
+
+# Debug and runtime logs
+*.log
+npm-debug.log*
+
+# Environment and local secret configs
+.env
+
+# OS system garbage files
+.DS_Store
+
+# IDE and Editors
+.idea/
