@@ -11,12 +11,13 @@
   "scripts": {
     "build": "turbo run build",
     "dev": "turbo run dev",
-    "dev:user": "npm run dev -w services/user-service",
+    "dev:user": "turbo run dev --filter=@skyhub/user-service",
+    "dev:flight": "turbo run dev --filter=@skyhub/flight-service",
     "lint": "turbo run lint",
     "clean": "turbo run clean",
     "format": "prettier --write \"**/*.{ts,js,json,md}\"",
     "format:check": "prettier --check \"**/*.{ts,js,json,md}\"",
-    "typecheck": "tsc --build"
+    "typecheck": "turbo run typecheck"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

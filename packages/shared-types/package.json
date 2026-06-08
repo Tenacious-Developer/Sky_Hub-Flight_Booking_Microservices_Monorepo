@@ -15,6 +15,7 @@
     "build": "tsc --build",
     "clean": "rimraf dist tsconfig.tsbuildinfo",
     "dev": "tsc --build --watch",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
   }
 }

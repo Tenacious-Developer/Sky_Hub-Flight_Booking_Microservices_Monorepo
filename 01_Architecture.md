@@ -33,6 +33,42 @@
 | 4 | **Personalized pricing without per-request User Service calls** | Stateless RS256 JWT claims propagated as HTTP headers by the Gateway | Zero network overhead for discount lookups during high-volume search |
 | 5 | **Background work must not block API response threads** | BullMQ delayed job queues backed by Redis, consumed by isolated Notification worker | Client gets instant response; emails and reminders are processed asynchronously |
 
+### Core User Journeys
+
+Three primary flows drive every architectural decision in SkyHub:
+
+| Journey | Services Touched (in order) | Communication Pattern |
+|---------|-----------------------------|-----------------------|
+| **Register / Login** | API Gateway → User Service → PostgreSQL | Sync HTTP + bcrypt + RS256 JWT |
+| **Search Flights** | API Gateway → Search Service → Redis → MongoDB | Sync HTTP + Cache-Aside + CQRS read model |
+| **Book a Flight** | API Gateway → Booking → Flight → Payment → Notification | Sync HTTP + Saga (RabbitMQ) + BullMQ async |
+
+**Golden Rule for data ownership:** Every service owns exactly one database. No service ever queries another service's database directly. All cross-service data flows through HTTP, Kafka, or RabbitMQ.
+
+---
+
+### Synchronous Seat Hold vs. Event-Driven Asynchronous Hold
+
+For Step 1 of the Booking Saga (holding seats), we explicitly chose a **Synchronous HTTP API Call** (`/internal/flights/:id/hold-seats`) rather than a fully asynchronous, event-driven pattern. 
+
+#### Why Not a Purely Event-Driven (Async) Hold?
+In a fully event-driven system:
+1. The Booking Service publishes `BOOKING_INITIATED` to a message queue.
+2. The Flight Service eventually consumes it, checks seat inventory, and publishes `SEAT_HELD` or `SEAT_HOLD_FAILED`.
+3. The client browser has to wait on a loading spinner, polling the server or listening via WebSockets/SSE to see if the seat hold was successful.
+
+While this decouples the services in time, it results in a **poor user experience** for high-contention resources like flight inventory. If a flight sells out, the user waits on a spinner only to get a "Reservation Failed" message minutes later.
+
+#### Our Hybrid Approach
+We combine synchronous inventory checks with asynchronous transaction finalization:
+- **Synchronous hold-seats**: Returns a definitive success/fail immediately to the user during checkout initiation.
+- **Asynchronous checkout & payment**: Handled via Saga Orchestration over RabbitMQ once the seat hold is verified.
+
+#### Reliability Optimizations for Synchronous Coupling
+To prevent the synchronous call from becoming a single point of failure or slowing down the system, we implement:
+- **Circuit Breaker (`opossum`)**: Instantly fails-fast and shows a helpful error message if the Flight Service becomes unresponsive, rather than exhausting connection pools and hanging the Booking Service.
+- **Internal HTTP Retries with Exponential Backoff (`axios-retry`)**: Automatically retries transient network blips (e.g., 1s, 2s, 4s delay) behind the scenes for maximum reliability.
+
 ### Service-Level Objectives (SLOs)
 
 These targets shape every architectural decision. If a choice helps meet an SLO, it is the right choice.
@@ -158,6 +194,90 @@ Your Node.js gateway can process ~5,000–15,000 requests/second before saturati
 - Geographic IP blocking
 - Web Application Firewall (WAF) rules for OWASP Top 10
 
+### 2.4 Full Service Connection Map
+
+This single diagram shows every service, its database, and every connection (HTTP, Kafka, RabbitMQ, BullMQ, Redis) at a glance. Read it top-down to trace any request through the system.
+
+```text
+                         CLIENT (Browser / Mobile)
+                               │ HTTPS
+                               ▼
+                    Cloudflare → NGINX Load Balancer
+                               │
+                    ┌──────────▼──────────┐
+                    │    API GATEWAY      │ :3000
+                    │  Rate limit ────────┼──► Redis DB 0
+                    │  JWT verify         │    (rate counters + JWT blacklist)
+                    │  Header inject      │
+                    │  Circuit breaker    │
+                    └──┬───┬───┬───┬──────┘
+                       │   │   │   │   (HTTP proxy — each arrow is a different route group)
+          ┌────────────┘   │   │   └─────────────────────┐
+          │                │   │                         │
+          ▼                ▼   ▼                         ▼
+  ┌──────────────┐  ┌──────────────┐  ┌──────────┐  ┌──────────────┐
+  │ USER SERVICE │  │FLIGHT SERVICE│  │  SEARCH  │  │   BOOKING    │
+  │   :3001      │  │   :3002      │  │  SERVICE │  │   SERVICE    │
+  │              │  │              │  │  :3006   │  │   :3003      │
+  │ PostgreSQL   │  │ PostgreSQL   │  │          │  │              │
+  │ skyhub_      │  │ skyhub_      │  │ MongoDB  │  │ PostgreSQL   │
+  │ user_db      │  │ flight_db    │  │ Redis DB1│  │ skyhub_      │
+  │              │  │              │  │          │  │ booking_db   │
+  │ RS256 sign   │  │ FOR UPDATE   │  │          │  │ saga_logs    │
+  │ bcrypt       │  │ row lock     │  │          │  │              │
+  └──────┬───────┘  └──────┬───────┘  └────▲─────┘  └──┬─────┬────┘
+         │                 │               │            │     │
+         │ Kafka           │ Kafka         │ Kafka      │HTTP │RabbitMQ
+         │ user-identity-  │ flight-       │ (consumer) │sync │booking.
+         │ events          │ inventory-    │            │hold │initiated
+         │                 │ events        │            │     │
+         └────────────────►└───────────────┘            │     ▼
+                     KAFKA BROKER                       │  ┌──────────────┐
+                                                        │  │   PAYMENT    │
+                                                        │  │   SERVICE    │
+                                                        │  │   :3004      │
+                                                        ▼  │              │
+                                              FLIGHT SVC   │ PostgreSQL   │
+                                              internal      │ skyhub_      │
+                                              endpoints:    │ payment_db   │
+                                              /hold-seats   │              │
+                                              /release-seats│ Redis DB 2   │
+                                                           │ (idempotency)│
+                                                           │              │
+                                                           │ Stripe SDK ──┼──► stripe.com
+                                                           │ ▲            │    (external)
+                                                           │ │ webhook     │
+                                                           └──┬───────────┘
+                                                              │ RabbitMQ
+                                                              │ payment.result
+                                                              ▼
+                                                         BOOKING SERVICE
+                                                         (RabbitMQ consumer)
+                                                         Updates saga state
+                                                              │
+                                                              │ BullMQ
+                                                              ▼ (Redis DB 3)
+                                                    ┌─────────────────────┐
+                                                    │  NOTIFICATION       │
+                                                    │  SERVICE (worker)   │
+                                                    │  No HTTP port       │
+                                                    │                     │
+                                                    │  Polls BullMQ jobs  │
+                                                    │  → HTTP GET         │
+                                                    │    /internal/       │
+                                                    │    bookings/:id     │
+                                                    │  → PDFKit           │
+                                                    │  → SendGrid ────────┼──► user email
+                                                    └─────────────────────┘
+```
+
+**How to read this diagram:**
+- Solid arrows `──►` = always-on connections (every request)
+- Every service box only talks to its own database (isolated ownership)
+- The Kafka broker sits in the middle decoupling Flight writes from Search reads
+- RabbitMQ sits between Booking and Payment for saga coordination
+- Notification Service has no inbound traffic — it only consumes from BullMQ
+
 ---
 
 ## 3. Inter-Service Communication Matrix
@@ -186,6 +306,101 @@ Your Node.js gateway can process ~5,000–15,000 requests/second before saturati
 ```
 
 **Golden Rule:** Use synchronous HTTP only when the caller cannot proceed without an immediate answer. Use async messaging for everything else.
+
+### 3.1 Communication Patterns — Channel Deep Dive
+
+SkyHub uses four distinct channels. Each is chosen for a specific reason — not interchangeable.
+
+#### Channel 1: Synchronous HTTP (User is Waiting)
+
+```text
+Client ──HTTPS──► Gateway ──HTTP──► Service
+                                        │
+                               1. Validate input (Zod)
+                               2. DB query / cache hit
+                               3. Business logic
+                                        │
+Client ◄──────────────────────── Response (sync, same request)
+```
+
+**Used for:** All client-facing endpoints, Booking → Flight seat hold.
+**Why:** User is staring at a spinner. They need a definitive yes/no before they can proceed.
+**Resilience stack:** Circuit breaker (opossum) fails fast → axios-retry handles transient blips.
+
+---
+
+#### Channel 2: Kafka (High-Throughput Event Streaming — CQRS)
+
+```text
+Flight Service                              Search Service
+      │                                           │
+      │ 1. Admin updates flight price             │
+      │ 2. BEGIN TRANSACTION                      │
+      │      INSERT flights ...                   │
+      │      INSERT outbox_events ...  ← same tx  │
+      │    COMMIT                                 │
+      │                                           │
+      │ 3. Outbox Worker polls (every 5s)         │
+      ├──── Kafka: flight-inventory-events ──────►│
+      │     Key = flightId                        │ 4. Upsert into MongoDB
+      │     (same flight → same partition          │ 5. Invalidate Redis cache tags
+      │      → ordered delivery guaranteed)       │    SMEMBERS tag:flight:{id} → DEL keys
+```
+
+**Used for:** Flight Service → Search Service (CQRS), User Service → consumers.
+**Why:** Decouples the write-model from the read-model completely. Search handles 1000× more QPS than writes without competing for the same DB connections.
+**Guarantee:** Outbox pattern → event is never lost even if the service crashes mid-publish.
+
+---
+
+#### Channel 3: RabbitMQ (Saga Coordination — Guaranteed Delivery)
+
+```text
+Booking Service                             Payment Service
+      │                                           │
+      │ 1. POST /bookings received                │
+      │ 2. Sync hold-seats (HTTP) ✓               │
+      │ 3. BEGIN TRANSACTION                      │
+      │      INSERT bookings {status: PENDING}    │
+      │      INSERT saga_logs {step: SEATS_HELD}  │
+      │      INSERT outbox_events {BOOKING_INIT}  │
+      │    COMMIT                                 │
+      │ 4. Outbox Worker publishes ───────────────►│
+      │    Exchange: skyhub.booking               │ 5. Check idempotency key (Redis DB 2)
+      │    Queue: booking.initiated               │ 6. stripe.paymentIntents.create(...)
+      │                                           │ 7. Stripe webhook arrives → INSERT payment
+      │                                           │ 8. Outbox publishes result
+      │◄─── Queue: payment.result ────────────────│
+      │ 9. Update saga_logs                       │
+      │    SUCCESS → UPDATE bookings CONFIRMED    │
+      │    FAILED  → HTTP release-seats → ROLLBACK│
+```
+
+**Used for:** Booking ↔ Payment saga (the only place in the system with distributed state).
+**Why:** RabbitMQ guarantees delivery even if one service is temporarily down. Messages wait in the queue — they are not lost.
+**DLQ:** After 3 nack+requeue cycles → `booking.initiated.dlq` for manual ops inspection.
+
+---
+
+#### Channel 4: BullMQ (Background Jobs — Never Block the API Thread)
+
+```text
+Booking Service       Redis DB 3         Notification Worker
+      │                    │                      │
+      │ After CONFIRMED:   │                      │
+      │ add job ───────────►                      │
+      │  BOOKING_CONFIRM   │                      │
+      │  PAYMENT_RECEIPT   │◄─── Worker polls ────│
+      │  BOOKING_REMINDER  │                      │
+      │    (delayed 24h)   │──── job payload ─────►
+      │                              5. HTTP GET /internal/bookings/:id
+      │                              6. PDFKit → generate ticket PDF
+      │                              7. SendGrid → send email
+      │                              Retry: 1min → 2min → 4min → DLQ
+```
+
+**Used for:** All notifications, flight reminders, seat-hold auto-expiry.
+**Why:** PDF generation + email delivery takes 2–5 seconds. Blocking the API request thread for this would degrade all concurrent users. Client gets an instant `202 Accepted` and the work happens asynchronously.
 
 ---
 
@@ -668,6 +883,8 @@ BullMQ [seat-timeout-queue] fires after 15 minutes
 
 **Responsibilities:**
 - Initiate booking, coordinate saga steps, handle all rollback paths.
+- **Synchronous Seat Hold & locking**: Connect synchronously to the Flight Service's seat-hold endpoint using a row-level pessimistic lock (`SELECT ... FOR UPDATE`) in `flight_db` to guarantee atomic seat reservation.
+- **Resilience Engineering**: Protect internal HTTP calls to the Flight Service with a circuit breaker (`opossum`) and transient network retries with exponential backoff (`axios-retry`).
 - SagaLog tracks every state transition for debugging and recovery.
 - All RabbitMQ consumers are idempotent — check current state before acting.
 - Outbox pattern for guaranteed RabbitMQ event publishing.
@@ -816,6 +1033,45 @@ DATABASE_URL="postgresql://user:pass@host:5432/db?connection_limit=10&pool_timeo
 ```
 
 For production at scale, add **PgBouncer** as a connection pooler between services and PostgreSQL, allowing thousands of app connections to share a small pool of actual DB connections.
+
+### Redis Logical Database Allocation
+
+A single Redis instance serves four completely separate purposes via logical database numbers. Each service connects to its own DB — no data mixing, no accidental cross-service reads.
+
+| DB | Owner | What's Stored | Key Pattern | TTL |
+|----|-------|--------------|-------------|-----|
+| **DB 0** | API Gateway | Rate-limit counters per IP | `rl:{ip}` | 15 min sliding window |
+| **DB 0** | API Gateway | JWT blacklist (on logout) | `blacklist:jti:{jti}` | Token's remaining lifetime |
+| **DB 0** | API Gateway | JWKS public key cache | `jwks:user-service` | 1 hour |
+| **DB 1** | Search Service | Search result cache | `search:{origin}:{dest}:{date}:{pax}:{cabin}` | 5 min |
+| **DB 1** | Search Service | Cache invalidation tag sets | `tag:flight:{flightId}` | 5 min |
+| **DB 2** | Payment Service | Idempotency keys | `idem:{bookingId}` | 30 days |
+| **DB 3** | Booking Service | BullMQ job store (producer) | Internal BullMQ keys | Per-job config |
+| **DB 3** | Notification Service | BullMQ job store (worker) | Internal BullMQ keys | Per-job config |
+
+**Why separate logical DBs instead of just key prefixes?**
+
+| Reason | Explanation |
+|--------|-------------|
+| Accidental wipe safety | `FLUSHDB` on DB 1 (stale search cache) cannot touch DB 0 (JWT blacklist) |
+| Different eviction policies | Cache (DB 1) can use `allkeys-lru`; blacklist (DB 0) must use `noeviction` |
+| Cleaner mental model | Each service's Redis URL in `.env` points to its own DB number — ownership is explicit |
+| Operational isolation | Redis `INFO keyspace` shows per-DB stats; easy to see if the cache is bloated |
+
+**Tag-based cache invalidation (DB 1):**
+```text
+When admin updates flight FL001:
+  Search Service Kafka consumer runs:
+    keys = Redis SMEMBERS "tag:flight:FL001"   → ["search:DEL:BOM:...", "search:DEL:HYD:..."]
+    Redis DEL keys[0], keys[1], ...            → removes all cached searches containing FL001
+    Redis DEL "tag:flight:FL001"               → clean up the tag set itself
+
+Why tags instead of KEYS *:
+  KEYS * is O(N) and blocks Redis — dangerous at scale.
+  Tag sets are O(1) lookup + O(M) delete where M = number of affected cache entries only.
+```
+
+---
 
 ### Transactional Outbox Pattern
 
@@ -1549,6 +1805,55 @@ SkyHub/                              ← Root Monorepo Directory
 ├── .prettierrc
 ├── .prettierignore
 └── package.json
+```
+
+### Package Dependency Graph
+
+Shared packages are built **before** services. Changing any package triggers a rebuild in every dependent service — Turbo tracks this automatically via its dependency graph in `turbo.json`.
+
+```text
+                    ┌─────────────────────────────────────────────┐
+                    │             SHARED PACKAGES                  │
+                    │  (built first, zero business logic)          │
+                    ├──────────────┬──────────────┬───────────────┤
+                    │ common-utils │ shared-types │message-broker │
+                    │              │              │               │
+                    │ AppError     │ ErrorCode    │ Kafka wrapper │
+                    │ Pino logger  │ BookingStatus│ RabbitMQ wrap │
+                    │ validateEnv  │ LoyaltyTier  │ BullMQ factory│
+                    │ AsyncStorage │ Event ifaces │               │
+                    └──────┬───────┴──────┬───────┴───────┬───────┘
+                           │              │               │
+                           └──────────────▼───────────────┘
+                                          │  workspace:* imports
+                     ┌────────────────────┼────────────────────┐
+                     │                    │                    │
+              ┌──────▼──────┐     ┌───────▼──────┐    ┌───────▼──────┐
+              │ user-service│     │flight-service│    │search-service│
+              └─────────────┘     └──────────────┘    └──────────────┘
+              ┌──────▼──────┐     ┌───────▼──────┐    ┌───────▼──────┐
+              │booking-svc  │     │payment-svc   │    │notification  │
+              └─────────────┘     └──────────────┘    │   -service   │
+                                                       └──────────────┘
+                                    api-gateway
+```
+
+**What each package provides to services:**
+
+| Package | Import | What services get |
+|---------|--------|-------------------|
+| `@skyhub/common-utils` | `workspace:*` | `AppError` (typed errors with HTTP status), `logger` (Pino with auto correlation ID), `validateEnv` (Zod env check on startup) |
+| `@skyhub/shared-types` | `workspace:*` | `ErrorCode` enum, `BookingStatus`, `LoyaltyTier`, `SagaState`, Kafka/RabbitMQ event TypeScript interfaces |
+| `@skyhub/message-broker` | `workspace:*` | Pre-configured Kafka producer/consumer factory, RabbitMQ publisher/consumer with DLQ wiring, BullMQ named queue factory |
+
+**Turbo build order (from `turbo.json`):**
+```text
+Step 1 (parallel):  build common-utils, build shared-types, build message-broker
+Step 2 (parallel):  build all 7 services  ← unblocked once Step 1 finishes
+Step 3 (parallel):  lint + test all packages and services
+
+Cache hit: if a package's source files haven't changed, Turbo skips its rebuild
+           and reuses the cached output — subsequent builds are near-instant.
 ```
 
 ---

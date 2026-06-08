@@ -15,3 +15,12 @@
 // }
 
 
+import { Request, Response } from 'express';
+import { AppError } from '../errors/AppError.js';
+
+/**
+ * Catches all unmatched paths and translates them into a clean 404 AppError
+ */
+export function notFoundHandler(req: Request, res: Response): void {
+  throw new AppError(`Cannot ${req.method} ${req.path}`, 404, 'NOT_FOUND');
+}

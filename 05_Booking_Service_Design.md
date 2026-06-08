@@ -121,7 +121,8 @@ SEAT TIMEOUT PATH (user abandoned payment):
 
 **Who can call:** Any authenticated user (`CUSTOMER`, `FLIGHT_ADMIN`, `SUPER_ADMIN`)
 
-**The three-step saga that runs synchronously before returning 201:**
+**Design Decision: Synchronous Hold vs. Asynchronous Event-Driven Hold**
+We use a **Synchronous HTTP API Call** to the Flight Service to hold seats during booking initiation, rather than an asynchronous event-driven message. This ensures the user gets immediate, real-time feedback on seat availability at checkout. In contrast, an asynchronous hold would require a loading spinner and WebSocket notification, resulting in poor user experience if the flight sells out.
 
 **Step 1 — Fetch Price + Hold Seats (two HTTP calls to Flight Service):**
 
@@ -137,9 +138,17 @@ SEAT TIMEOUT PATH (user abandoned payment):
 
 1c. PATCH http://flight-service:3002/internal/flights/{flightId}/hold-seats
     Body: { seats, bookingId: pre-generated UUID }
-    → 200 { remainingSeats, heldUntil } → proceed
-    → 409 INSUFFICIENT_SEATS → return 409 to client immediately
-    → 5xx / network error → Circuit Breaker opens, return 503 to client
+    
+    Database Locking (inside Flight Service):
+      - Executes a SELECT ... FOR UPDATE row-level pessimistic lock on the flight record.
+      - Decrements available seats safely within an ACID PostgreSQL transaction.
+      - Returns heldUntil timestamp (e.g., NOW + 15 minutes).
+      
+    Result Resolution & Network Reliability:
+      → 200 { remainingSeats, heldUntil } → proceed
+      → 409 INSUFFICIENT_SEATS → return 409 to client immediately
+      → 5xx / network error → Handled by Opossum Circuit Breaker (opens after 3 failures, returns 503)
+      → Transient Network Blips → Handled by Axios-Retry (3 retries with exponential backoff: 1s, 2s, 4s)
 ```
 
 **Step 2 — Atomic DB Write (all-or-nothing in one Prisma transaction):**

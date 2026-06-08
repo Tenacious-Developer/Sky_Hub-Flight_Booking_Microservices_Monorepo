@@ -349,125 +349,247 @@ Returns `200` if all checks pass, `503` if any check fails. Used by the Load Bal
 
 ---
 
+## 2.1 Enterprise-Grade Feature Enhancements (IAM Standards)
+
+To ensure this service matches professional production-grade systems (like **Auth0, Keycloak, and Clerk**), the core auth capabilities are reinforced with the following industry-standard enhancements.
+
+### 1. Granular Permissions & Scopes inside JWT Claims
+Instead of hardcoding standard roles (e.g. `CUSTOMER` or `FLIGHT_ADMIN`) inside downstream microservices, the User Service translates dynamic RBAC relationships at login and injects a dedicated `permissions` string array (scopes) directly into the Access Token claims:
+
+```json
+{
+  "sub": "7b58c281-a5bf-4050-a922-a72a1cd40a92",
+  "jti": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "role": "FLIGHT_ADMIN",
+  "permissions": [
+    "flights:read",
+    "flights:create",
+    "flights:delete",
+    "bookings:read"
+  ],
+  "iat": 1782500000,
+  "exp": 1782500900
+}
+```
+*   **Decoupled Verification**: Downstream microservices check if the token possesses the specific permission (e.g., `'flights:create'`), completely decoupling route security logic from central user administration.
+
+### 2. 6-Digit Cryptographic Numeric OTPs
+To ensure seamless native iOS/Android mobile compatibility and reduce verification friction, verification links are replaced with **cryptographically secure 6-digit numeric One-Time Passwords (OTPs)**:
+1.  Generate raw code via `crypto.randomInt(100000, 999999).toString()`.
+2.  Encrypt it using **SHA-256** and store the hash with a strict 10-minute expiration window on the user record (`email_verify_token`).
+3.  The client inputs the raw 6-digit code which is hashed and matched inside `/api/v1/auth/verify-otp`.
+
+### 3. Device-Aware Active Session Control
+Users can view, manage, and selectively revoke their active logins from other devices (avoiding full-device lockouts).
+
+*   **`GET /api/v1/auth/sessions` (Auth Required)**: Parses the request's `User-Agent` string into human-readable device and browser metrics, fetching all active sessions from the `refresh_tokens` database table.
+*   **`DELETE /api/v1/auth/sessions/:sessionId` (Auth Required)**: Instantly deletes the specified refresh token row, forcing the targeted device to log out without disrupting the user's current session.
+
+### 4. Time-Based Authenticator MFA (TOTP)
+Optional security reinforcement using authenticator tools (Google Authenticator, Microsoft Authenticator):
+1.  **Enable MFA**: Generate a cryptographically random Base32 secret key and output a standard provisioning URL: `otpauth://totp/SkyHub:user@email.com?secret=SECRETKEY&issuer=SkyHub`.
+2.  **Verify Setup**: Validate the user's initial code entry using the `otplib` library. Set `mfa_enabled = true` on the database record.
+3.  **Step-Up Auth**: If `mfa_enabled` is active during login, the service returns a status `MFA_REQUIRED` alongside a temporary token. The final Access/Refresh tokens are only generated once the client submits their authenticator OTP to `/api/v1/auth/mfa/verify`.
+
+### 5. Immutable Security Audit Logging
+Critical security operations compile structured history logs into an analytical pipeline (or Kafka stream `security-audit-events`) to ensure full compliance auditing:
+
+```json
+{
+  "userId": "7b58c281-a5bf-4050-a922-a72a1cd40a92",
+  "action": "USER_LOCKED",
+  "ipAddress": "192.168.1.99",
+  "device": "Firefox / Ubuntu Linux",
+  "metadata": {
+    "reason": "5 consecutive failed login attempts",
+    "lockExpiresAt": "2026-05-30T16:00:00Z"
+  },
+  "timestamp": "2026-05-30T15:30:00Z"
+}
+```
+
+---
+
 ## 3. Database Design & Prisma Schema
+
+To align with modern industry-standard designs for **Identity & Access Management (IAM)** and to ensure strict security, this database architecture separates **Core Authentication Credentials**, **Public Profile metadata**, **Active Sessions**, **Security Audit Logs**, and **Granular Authorization (Dynamic RBAC)** into distinct decoupled tables.
 
 ### 3.1 Entity-Relationship Diagram
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                         USERS                           │
-├─────────────────────────────────────────────────────────┤
-│ id                        UUID         PK               │
-│ email                     VARCHAR(255) UNIQUE INDEX     │
-│ password_hash             VARCHAR(255) NOT NULL         │
-│ name                      VARCHAR(255) NOT NULL         │
-│ role                      ENUM         DEFAULT CUSTOMER │
-│ loyalty_tier              ENUM         DEFAULT SILVER   │
-│ booking_count             INT          DEFAULT 0        │
-│ is_active                 BOOLEAN      DEFAULT true     │
-│ email_verified            BOOLEAN      DEFAULT false    │
-│ email_verification_token  VARCHAR(64)  NULL UNIQUE      │
-│ email_verification_expires_at TIMESTAMPTZ  NULL          │
-│ password_reset_token      VARCHAR(64)  NULL UNIQUE      │
-│ password_reset_expires_at TIMESTAMPTZ  NULL             │
-│ failed_login_attempts     INT          DEFAULT 0        │
-│ locked_until              TIMESTAMPTZ  NULL             │
-│ last_login_at             TIMESTAMPTZ  NULL             │
-│ created_at                TIMESTAMPTZ  DEFAULT NOW()    │
-│ updated_at                TIMESTAMPTZ  AUTO UPDATE      │
-└────────────────────────┬────────────────────────────────┘
-                         │ 1
-                         │
-                         │ has many
-                         │
-                         │ N
-┌────────────────────────▼────────────────────────────────┐
-│                    REFRESH_TOKENS                        │
-├─────────────────────────────────────────────────────────┤
-│ id          UUID         PK                             │
-│ user_id     UUID         FK → users.id ON DELETE CASCADE│
-│ token_hash  VARCHAR(64)  UNIQUE  (SHA-256 of raw token) │
-│ device_info VARCHAR(500) NULL                           │
-│ ip_address  VARCHAR(45)  NULL   (IPv6 max length)       │
-│ expires_at  TIMESTAMPTZ  NOT NULL                       │
-│ created_at  TIMESTAMPTZ  DEFAULT NOW()                  │
-└─────────────────────────────────────────────────────────┘
+                              ┌────────────────────────┐
+                              │         USERS          │
+                              │ (Core Auth Credentials)│
+                              ├────────────────────────┤
+                              │ id (UUID) [PK]         │
+                              │ email (VARCHAR) [UQ]   │
+                              │ password_hash (VARCHAR)│
+                              │ is_active (BOOLEAN)    │
+                              │ failed_attempts (INT)  │
+                              │ locked_until (TIMESTAMPTZ)
+                              │ mfa_enabled (BOOLEAN)  │
+                              │ mfa_secret (VARCHAR)   │
+                              └───────────┬────────────┘
+                                          │ 1
+                                          │
+                  ┌───────────────────────┼───────────────────────┐
+                  │ 1                     │ 1                     │ 1
+                  ▼                       ▼                       ▼
+      ┌───────────────────────┐  ┌───────────────────────┐  ┌───────────────────────┐
+      │     USER_PROFILES     │  │    REFRESH_TOKENS     │  │      AUDIT_LOGS       │
+      ├───────────────────────┤  ├───────────────────────┤  ├───────────────────────┤
+      │ user_id (UUID)[PK, FK]│  │ id (UUID) [PK]         │  │ id (UUID) [PK]         │
+      │ full_name (VARCHAR)   │  │ user_id (UUID) [FK]    │  │ user_id (UUID) [FK]    │
+      │ loyalty_tier (ENUM)   │  │ token_hash (VARCHAR) UQ│  │ action (VARCHAR)      │
+      │ booking_count (INT)   │  │ expires_at (TIMESTAMPTZ)│  │ timestamp (TIMESTAMPTZ)│
+      └───────────────────────┘  └───────────────────────┘  └───────────────────────┘
 
-┌─────────────────────────────────────────────────────────┐
-│                    OUTBOX_EVENTS                         │
-├─────────────────────────────────────────────────────────┤
-│ id           UUID         PK                            │
-│ event_type   VARCHAR(100) NOT NULL                      │
-│ payload      JSONB        NOT NULL                      │
-│ status       ENUM         DEFAULT PENDING               │
-│ created_at   TIMESTAMPTZ  DEFAULT NOW()                 │
-│ published_at TIMESTAMPTZ  NULL                          │
-└─────────────────────────────────────────────────────────┘
+                           - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+                                                     RBAC MODULE
+                        ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+                        │    USERS     │ 1  N │  USER_ROLES  │ N  1 │    ROLES     │
+                        │ (Auth Table) ├─────►│ (Join Table) ◄──────┤ (Admin/Cust) │
+                        └──────────────┘      └──────────────┘      └──────┬───────┘
+                                                                           │ 1
+                                                                           │
+                                                                           ▼ N
+                                                                    ┌──────────────┐
+                                                                    │  ROLE_PERMS  │
+                                                                    │ (Join Table) │
+                                                                    └──────▲───────┘
+                                                                           │ N
+                                                                           │ 1
+                                                                    ┌──────┴───────┐
+                                                                    │ PERMISSIONS  │
+                                                                    │(read:flights)│
+                                                                    └──────────────┘
 ```
+
+---
 
 ### 3.2 Column-by-Column Justification
 
-#### `users` table
+#### `users` (Core Identity & Security Credentials)
+This table acts as the vault. It only handles identity verification, multi-factor settings, security lockout metrics, and account status/lifecycles.
 
 | Column | Type | Why This Design Choice |
-|---|---|---|
-| `id` | UUID v4 | Auto-increment integers expose row count (business intelligence leak) and cause conflicts in DB migrations or merges. UUIDs are globally unique. |
-| `email` | VARCHAR(255) | RFC 5321 max email length is 254 chars. B-Tree indexed because every login, registration-check, and password-reset lookup is by email. |
-| `password_hash` | VARCHAR(255) | Bcrypt output is always 60 characters. VARCHAR(255) is safe headroom. Never store plaintext. |
-| `role` | ENUM | Enum prevents invalid values at the DB level — a code bug cannot accidentally write `"ADMIN"` instead of `"SUPER_ADMIN"`. |
-| `loyalty_tier` | ENUM | Same reasoning. Enum enforces the contract at DB level. |
-| `booking_count` | INT | Maintained by the User Service's Kafka consumer listening to the Booking Service. Used to trigger automatic tier upgrades. |
-| `is_active` | BOOLEAN DEFAULT true | Soft ban — deactivate an account without destroying data. Important for audit trails and potential account recovery. |
-| `email_verified` | BOOLEAN DEFAULT false | Gates login. An unverified account cannot generate JWTs. Prevents disposable email registrations. |
-| `email_verification_token` | VARCHAR(64) UNIQUE NULL | Stores SHA-256 hash (32 bytes = 64 hex chars) of the raw verification token. NULL when not pending verification. UNIQUE prevents two users accidentally getting the same token hash. |
-| `email_verification_expires_at` | TIMESTAMPTZ NULL | Verification links expire in 24 hours. Prevents stale links from being used years later. |
-| `password_reset_token` | VARCHAR(64) NULL UNIQUE | Same hashing approach as verification token. NULL when no reset is pending. |
-| `password_reset_expires_at` | TIMESTAMPTZ NULL | Reset links expire in 1 hour — tighter window than email verification because a reset link in an attacker's hands grants full account access. |
-| `failed_login_attempts` | INT DEFAULT 0 | Incremented on wrong password, reset on success. Triggers lockout at 5. |
-| `locked_until` | TIMESTAMPTZ NULL | The precise moment the lockout expires. NULL when not locked. Service checks `locked_until > NOW()` on every login attempt. |
-| `last_login_at` | TIMESTAMPTZ NULL | Security auditing. Useful for "Your account was accessed from a new location" warnings. Also used for inactive account cleanup. |
-| `created_at` | TIMESTAMPTZ | `TIMESTAMPTZ` stores timezone offset, essential for a global platform. Do NOT use bare `TIMESTAMP` which loses timezone info. |
-| `updated_at` | TIMESTAMPTZ | Prisma `@updatedAt` auto-sets this on every UPDATE. |
+| :--- | :--- | :--- |
+| `id` | UUID | Globally unique, safe from business intelligence leaks (auto-increment integers leak scale). |
+| `email` | VARCHAR(255) | B-Tree indexed and unique. Used as the unique login handle. |
+| `password_hash` | VARCHAR(255) | Holds the highly secure Bcrypt hash (rounds=12). Never loaded during profile requests. |
+| `is_active` | BOOLEAN | Allows administrative soft deactivation (e.g. banning) without wiping audit histories. |
+| `failed_login_attempts` | INT | Lockout tracker. Incremented on wrong passwords, reset on success. |
+| `locked_until` | TIMESTAMPTZ | Absolute lock expiration time. The auth pipeline verifies `locked_until > NOW()`. |
+| `mfa_enabled` | BOOLEAN | Indicates if the user has completed authenticator TOTP setup. |
+| `mfa_secret` | VARCHAR(255) | Stores the cryptographically encrypted Base32 MFA secret key. |
+| `mfa_backup_codes` | JSON | Holds hashed MFA backup recovery codes to prevent lockout if user loses device. |
+| `email_verify_token` | VARCHAR(255) | SHA-256 hash of the 6-digit OTP. B-Tree indexed but not globally unique to prevent unique constraint conflicts (due to low-entropy OTP space collisions). |
+| `reset_token` | VARCHAR(255) | SHA-256 hash of the password recovery 6-digit OTP. B-Tree indexed but not unique for OTP collision safety. |
+| `deleted_at` | TIMESTAMPTZ | Enables soft-deletion for GDPR compliance while maintaining foreign-key data integrity. |
 
-#### `refresh_tokens` table
+#### `user_profiles` (Public Details & Domain metadata)
+Separating profile data ensures credentials cannot be accidentally leaked during standard metadata fetches. `user_id` acts as the primary key.
 
 | Column | Type | Why This Design Choice |
-|---|---|---|
-| `token_hash` | VARCHAR(64) UNIQUE | SHA-256 of the raw 128-char hex token. 256-bit hash = 32 bytes = 64 hex chars. UNIQUE index enables O(1) exact-match lookup: `WHERE token_hash = ?` |
-| `device_info` | VARCHAR(500) NULL | Stores User-Agent string (parsed). Allows "manage your devices" feature. Truncated at 500 to prevent DB bloat from enormous User-Agent headers. |
-| `ip_address` | VARCHAR(45) NULL | IPv6 max length is 39 chars. VARCHAR(45) gives headroom. Used for security audit: "new login from 192.168.x.x". |
-| `expires_at` | TIMESTAMPTZ | Token expiry. Checked on every `/refresh` call. Should also run a periodic cleanup job deleting rows where `expires_at < NOW()`. |
-| No `updated_at` | — | Refresh tokens are immutable. Created once, deleted on use (rotation) or on logout. Never updated. |
+| :--- | :--- | :--- |
+| `user_id` | UUID (PK, FK) | Unique primary key mapping back 1-to-1 to the `users` table. Saves space and index overhead compared to redundant UUID keys. Cascade deletes. |
+| `full_name` | VARCHAR(100) | Standard username container, trimmed. |
+| `loyalty_tier` | ENUM (`LoyaltyTier`) | Holds `'SILVER'`, `'GOLD'`, or `'PLATINUM'`. Default `'SILVER'`. Enforced at DB level to prevent invalid states. |
+| `booking_count` | INT | Tracked by Kafka event listener. Promotes users once threshold is crossed. |
 
-#### `outbox_events` table
+#### `roles` & `permissions` (Decoupled RBAC Authorization)
+Enabling multi-role assignment and dynamic run-time capabilities without modifying database enums or core codebases.
 
-| Column | Type | Why This Design Choice |
-|---|---|---|
-| `event_type` | VARCHAR(100) | String type names like `USER_REGISTERED`. Avoids ENUM here — you want to add new event types without a DB migration. |
-| `payload` | JSONB | Binary JSON in PostgreSQL. Indexed, queryable, and compact. Stores the full Kafka message envelope. |
-| `status` | ENUM(PENDING, PUBLISHED, FAILED) | PENDING items are picked up by the OutboxWorker. FAILED items need ops attention. PUBLISHED items are archived. |
-| Compound index on `(status, created_at)` | — | The OutboxWorker query is: `WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 100`. This index makes it instant. |
+| Table | Column | Type | Purpose |
+| :--- | :--- | :--- | :--- |
+| `roles` | `name` | VARCHAR (UQ) | e.g. `'CUSTOMER'`, `'FLIGHT_ADMIN'`, `'SUPER_ADMIN'`. |
+| `permissions` | `name` | VARCHAR (UQ) | e.g. `'flights:create'`, `'users:ban'`. Allows granular check logic. |
+| `user_roles` | `(user_id, role_id)` | UUID (Composite PK) | Many-to-many lookup table connecting users to multiple roles. Index added on `role_id` for inverse queries. |
+| `role_permissions` | `(role_id, perm_id)` | UUID (Composite PK) | Many-to-many lookup table mapping rights to active roles. Index added on `permission_id` for inverse queries. |
 
-### 3.3 Complete Prisma Schema
+#### `audit_logs` (Analytical Security Compliance Logging)
+Allows administrators to audit security operations natively without performing expensive log aggregation scans.
+
+| Column | Type | Purpose |
+| :--- | :--- | :--- |
+| `id` | UUID (PK) | Globally unique log identifier. |
+| `user_id` | UUID (FK) | Maps back to the affected `User` (SetNull on delete). |
+| `action` | VARCHAR(100) | Audit action e.g. `'USER_LOCKED'`, `'PASSWORD_CHANGED'`, `'MFA_ENABLED'`. |
+| `ip_address` | VARCHAR(45) | Captures client IP (supports IPv4/IPv6). |
+| `device` | VARCHAR(255) | Stores client's parsed user-agent details. |
+| `metadata` | JSON | Stores structured operational contexts (reasons, parameters). |
+| `timestamp` | TIMESTAMPTZ | Time of audit execution. |
+
+---
+
+### 3.3 Complete Production-Grade Prisma Schema
 
 **File: `services/user-service/prisma/schema.prisma`**
 
 ```prisma
-generator client {
-  provider = "prisma-client-js"
-}
-
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
-// ─── Enums ────────────────────────────────────────────────────────────────────
+generator client {
+  provider = "prisma-client-js"
+}
 
-enum UserRole {
-  CUSTOMER
-  FLIGHT_ADMIN
-  SUPER_ADMIN
+// ─── 1. CORE AUTHENTICATION (The Credential Vault) ───────────────────────────
+model User {
+  id                   String        @id @default(uuid())
+  email                String        @unique
+  passwordHash         String        @map("password_hash")
+  isActive             Boolean       @default(true) @map("is_active")
+  
+  // Security / Lockout properties
+  failedLoginAttempts  Int           @default(0) @map("failed_login_attempts")
+  lockedUntil          DateTime?     @map("locked_until")
+  lastLoginAt          DateTime?     @map("last_login_at")
+  
+  // MFA (TOTP) Properties
+  mfaEnabled           Boolean       @default(false) @map("mfa_enabled")
+  mfaSecret            String?       @map("mfa_secret")
+  mfaBackupCodes       Json?         @map("mfa_backup_codes")
+  
+  // Verification & Reset (Removed unique constraint on low-entropy tokens to prevent OTP collisions)
+  emailVerified        Boolean       @default(false) @map("email_verified")
+  emailVerifyToken     String?       @map("email_verify_token") // SHA-256 hash of OTP
+  emailVerifyExpiresAt DateTime?     @map("email_verify_expires_at")
+  resetToken           String?       @map("reset_token") // SHA-256 hash of OTP
+  resetExpiresAt       DateTime?     @map("reset_expires_at")
+
+  // Audit and lifecycle
+  createdAt            DateTime      @default(now()) @map("created_at")
+  updatedAt            DateTime      @updatedAt @map("updated_at")
+  deletedAt            DateTime?     @map("deleted_at")
+
+  // Relations
+  profile              UserProfile?
+  refreshTokens        RefreshToken[]
+  userRoles            UserRole[]
+  auditLogs            AuditLog[]
+
+  @@index([email])
+  @@index([emailVerifyToken])
+  @@index([resetToken])
+  @@map("users")
+}
+
+// ─── 2. USER PROFILE (Optimized 1-to-1 relationship using user_id as PK) ─────
+model UserProfile {
+  userId       String      @id @map("user_id")
+  fullName     String      @map("full_name")
+  
+  // Loyalty Domain
+  loyaltyTier  LoyaltyTier @default(SILVER) @map("loyalty_tier")
+  bookingCount Int         @default(0) @map("booking_count")
+
+  // Foreign Key constraints
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_profiles")
 }
 
 enum LoyaltyTier {
@@ -476,78 +598,114 @@ enum LoyaltyTier {
   PLATINUM
 }
 
-enum OutboxStatus {
-  PENDING
-  PUBLISHED
-  FAILED
+// ─── 3. DYNAMIC RBAC (Roles & Granular Permissions) ─────────────────────────
+model Role {
+  id              String           @id @default(uuid())
+  name            String           @unique // e.g. "CUSTOMER", "FLIGHT_ADMIN", "SUPER_ADMIN"
+  description     String?
+  
+  userRoles       UserRole[]
+  rolePermissions RolePermission[]
+
+  @@map("roles")
 }
 
-// ─── Models ───────────────────────────────────────────────────────────────────
+model Permission {
+  id              String           @id @default(uuid())
+  name            String           @unique // e.g. "flights:create", "flights:delete", "users:ban"
+  description     String?
 
-model User {
-  id                         String      @id @default(uuid())
-  email                      String      @unique
-  passwordHash               String      @map("password_hash")
-  name                       String
-  role                       UserRole    @default(CUSTOMER)
-  loyaltyTier                LoyaltyTier @default(SILVER)     @map("loyalty_tier")
-  bookingCount               Int         @default(0)          @map("booking_count")
-  isActive                   Boolean     @default(true)       @map("is_active")
-  emailVerified              Boolean     @default(false)      @map("email_verified")
-  emailVerificationToken     String?     @unique              @map("email_verification_token")
-  emailVerificationExpiresAt DateTime?                        @map("email_verification_expires_at")
-  passwordResetToken         String?     @unique              @map("password_reset_token")
-  passwordResetExpiresAt     DateTime?                        @map("password_reset_expires_at")
-  failedLoginAttempts        Int         @default(0)          @map("failed_login_attempts")
-  lockedUntil                DateTime?                        @map("locked_until")
-  lastLoginAt                DateTime?                        @map("last_login_at")
-  createdAt                  DateTime    @default(now())      @map("created_at")
-  updatedAt                  DateTime    @updatedAt           @map("updated_at")
+  rolePermissions RolePermission[]
 
-  refreshTokens RefreshToken[]
-
-  @@index([email])
-  @@map("users")
+  @@map("permissions")
 }
 
+// Many-to-Many Join Table: Users to Roles
+model UserRole {
+  userId      String       @map("user_id")
+  roleId      String       @map("role_id")
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role        Role         @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId]) // Composite Primary Key
+  @@index([roleId])      // Speeds up searching users by role
+  @@map("user_roles")
+}
+
+// Many-to-Many Join Table: Roles to Permissions
+model RolePermission {
+  roleId       String      @map("role_id")
+  permissionId String      @map("permission_id")
+
+  role         Role        @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission  @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId]) // Composite Primary Key
+  @@index([permissionId])      // Speeds up searching roles by permission
+  @@map("role_permissions")
+}
+
+// ─── 4. SECURITY TOKENS & OUTBOX EVENTS ─────────────────────────────────────
 model RefreshToken {
-  id         String   @id @default(uuid())
+  id         String   @id @default(uuid()) // Session ID
   userId     String   @map("user_id")
-  tokenHash  String   @unique  @map("token_hash")
+  tokenHash  String   @unique @map("token_hash") // SHA-256 hash of rotated token
   deviceInfo String?  @map("device_info")
   ipAddress  String?  @map("ip_address")
   expiresAt  DateTime @map("expires_at")
   createdAt  DateTime @default(now()) @map("created_at")
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@map("refresh_tokens")
 }
 
 model OutboxEvent {
-  id          String       @id @default(uuid())
-  eventType   String       @map("event_type")
+  id          String   @id @default(uuid())
+  eventType   String   @map("event_type")
   payload     Json
-  status      OutboxStatus @default(PENDING)
-  createdAt   DateTime     @default(now()) @map("created_at")
-  publishedAt DateTime?    @map("published_at")
+  status      String   @default("PENDING") // PENDING, PUBLISHED, FAILED
+  createdAt   DateTime @default(now()) @map("created_at")
+  publishedAt DateTime? @map("published_at")
 
   @@index([status, createdAt])
   @@map("outbox_events")
+}
+
+// ─── 5. SECURITY AUDIT LOGS ─────────────────────────────────────────────────
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?  @map("user_id")
+  action    String   @map("action")
+  ipAddress String?  @map("ip_address")
+  device    String?  @map("device")
+  metadata  Json?    @map("metadata")
+  timestamp DateTime @default(now()) @map("timestamp")
+
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([action])
+  @@index([timestamp])
+  @@map("audit_logs")
 }
 ```
 
 ### 3.4 Database Indexes Summary
 
 | Table | Index | Type | Purpose |
-|---|---|---|---|
-| `users` | `email` | B-Tree UNIQUE | Login, registration duplicate check, password reset lookups |
-| `users` | `email_verification_token` | B-Tree UNIQUE | Email verification lookup |
-| `users` | `password_reset_token` | B-Tree UNIQUE | Password reset lookup |
-| `refresh_tokens` | `token_hash` | B-Tree UNIQUE | Refresh token lookup on every `/refresh` call |
-| `refresh_tokens` | `user_id` | B-Tree | Find all tokens for a user on logout-all |
-| `outbox_events` | `(status, created_at)` | Composite B-Tree | Outbox worker polling query |
+| :--- | :--- | :--- | :--- |
+| `users` | `email` | B-Tree UNIQUE | Exact match credential lookups during authentication. |
+| `users` | `email_verify_token` | B-Tree UNIQUE | One-way hash verification lookup. |
+| `users` | `reset_token` | B-Tree UNIQUE | Password recovery token validation. |
+| `user_profiles` | `user_id` | B-Tree UNIQUE | Dynamic 1-to-1 fetching for metadata. |
+| `roles` | `name` | B-Tree UNIQUE | Role checking constraint. |
+| `permissions` | `name` | B-Tree UNIQUE | Permission checking constraint. |
+| `refresh_tokens` | `token_hash` | B-Tree UNIQUE | O(1) matching on `/refresh` session validations. |
+| `refresh_tokens` | `user_id` | B-Tree | Locates all sessions for single/global logs. |
+| `outbox_events` | `(status, created_at)` | Composite B-Tree | High-speed polling query indexing. |
 
 ---
 
@@ -582,12 +740,17 @@ openssl genrsa -out private.pem 2048
 openssl rsa -in private.pem -pubout -out public.pem
 ```
 
-**JWT payload (minimal — no PII):**
+**JWT payload (minimal — no PII, granular scopes included):**
 ```json
 {
   "sub":         "7b58c281-a5bf-4050-a922-a72a1cd40a92",
   "role":        "CUSTOMER",
-  "loyaltyTier": "GOLD",
+  "loyaltyTier": "SILVER",
+  "permissions": [
+    "flights:read",
+    "bookings:read",
+    "bookings:create"
+  ],
   "jti":         "f47ac10b-58cc-4372-a567-0e02b2c3d479",
   "iat":         1782500000,
   "exp":         1782500900
@@ -646,28 +809,29 @@ await bcrypt.compare(password, user?.passwordHash ?? dummyHash);
 
 ## 5. Complete REST API Specification
 
-All endpoints are prefixed with `/api/v1` at the Gateway level. Internally the User Service listens on `/api/v1/auth` routes.
+All endpoints are prefixed with `/api/v1` at the Gateway level. Internally, the User Service listens on `/api/v1/auth` and `/api/v1/admin` routes.
 
 ### Standard Response Envelope
 
-Every response, success or error, uses this shape:
+Every response, success or error, uses this uniform JSON shape:
 
 ```typescript
-// Success
+// Success Response Envelope
 {
   success: true,
   message: string,
-  data: object | null,
-  traceId: string         // X-Correlation-ID from request header
+  data: object | array | null,
+  traceId: string         // Unique correlation ID
 }
 
-// Error
+// Error Response Envelope (Ultimate Industry-Standard)
 {
   success: false,
   error: {
-    code: string,         // machine-readable error code
-    message: string,      // human-readable message
-    details?: Array<{ field: string, message: string }>  // Zod validation errors
+    statusCode: number,   // Numeric HTTP Status Code (e.g. 409, 400, 401)
+    name: string,         // Machine-readable error code (e.g. 'CONFLICT', 'VALIDATION_ERROR')
+    message: string,      // Human-readable message
+    details?: Array<{ field: string, message: string }> // Optional field validations
   },
   traceId: string
 }
@@ -675,440 +839,704 @@ Every response, success or error, uses this shape:
 
 ---
 
-### Endpoint 1: POST /api/v1/auth/register
+### 5.1 Standard Authentication & Profile Endpoints
 
-**Auth required:** No  
-**Rate limit:** 20 requests / 15 min per IP (enforced at Gateway)
-
-**Request:**
-```json
-{
-  "name": "John Doe",
-  "email": "john.doe@example.com",
-  "password": "SecurePass1!"
-}
-```
-
-**Validations (Zod):**
-```
-name:     string, min 2, max 100, trim whitespace
-email:    valid email format, lowercase, trim
-password: string, min 8, max 128,
-          regex: must contain uppercase + lowercase + digit + special char
-```
-
-**Success Response — 201 Created:**
-```json
-{
-  "success": true,
-  "message": "Registration successful. Please check your email to verify your account.",
-  "data": {
-    "userId": "7b58c281-a5bf-4050-a922-a72a1cd40a92",
-    "name": "John Doe",
-    "email": "john.doe@example.com",
-    "role": "CUSTOMER",
-    "loyaltyTier": "SILVER",
-    "emailVerified": false
-  },
-  "traceId": "tr-f47ac10b-58cc-4372"
-}
-```
-
-**Error Responses:**
-```
-400 VALIDATION_ERROR    → name/email/password failed Zod schema
-409 CONFLICT            → email already registered
-500 INTERNAL_ERROR      → unexpected server error
-```
-
----
-
-### Endpoint 2: POST /api/v1/auth/verify-email
-
-**Auth required:** No
-
-**Request:**
-```json
-{ "token": "a3f2b1c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2" }
-```
-
-**Success Response — 200 OK:**
-```json
-{
-  "success": true,
-  "message": "Email verified successfully. You can now log in.",
-  "data": null,
-  "traceId": "..."
-}
-```
-
-**Error Responses:**
-```
-400 INVALID_TOKEN       → token not found or expired
-400 ALREADY_VERIFIED    → account is already verified
-```
-
----
-
-### Endpoint 3: POST /api/v1/auth/resend-verification
-
-**Auth required:** No
-
-**Request:**
-```json
-{ "email": "john.doe@example.com" }
-```
-
-**Success Response — 200 OK:**
-```json
-{
-  "success": true,
-  "message": "If your account exists and is unverified, a new verification email has been sent.",
-  "data": null,
-  "traceId": "..."
-}
-```
-
-Always returns 200 regardless of whether the email exists (prevents enumeration). Rate-limited to 1 resend per 2 minutes per account.
-
----
-
-### Endpoint 4: POST /api/v1/auth/login
-
-**Auth required:** No  
-**Rate limit:** 20 requests / 15 min per IP (enforced at Gateway)
-
-**Request:**
-```json
-{
-  "email": "john.doe@example.com",
-  "password": "SecurePass1!"
-}
-```
-
-**Success Response — 200 OK:**
-```json
-{
-  "success": true,
-  "message": "Login successful.",
-  "data": {
-    "user": {
-      "userId": "7b58c281-a5bf-4050-a922-a72a1cd40a92",
+#### Endpoint 1: POST /api/v1/auth/register
+*   **Auth required**: No
+*   **Request Body**:
+    ```json
+    {
       "name": "John Doe",
       "email": "john.doe@example.com",
-      "role": "CUSTOMER",
-      "loyaltyTier": "GOLD",
-      "emailVerified": true,
-      "lastLoginAt": "2026-05-28T09:00:00.000Z"
-    },
-    "tokens": {
-      "accessToken": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
-      "refreshToken": "a3f2b1c4...128-hex-chars...",
-      "accessTokenExpiresAt": "2026-05-28T10:15:00.000Z",
-      "refreshTokenExpiresAt": "2026-06-04T10:00:00.000Z"
+      "password": "SecurePassword1!"
     }
-  },
-  "traceId": "..."
-}
-```
-
-**Error Responses:**
-```
-400 VALIDATION_ERROR         → invalid email/password format
-401 UNAUTHORIZED             → wrong password
-401 EMAIL_NOT_VERIFIED       → account not yet verified
-401 ACCOUNT_INACTIVE         → account was deactivated
-423 ACCOUNT_LOCKED           → {
-                                  "code": "ACCOUNT_LOCKED",
-                                  "message": "Account locked due to too many failed attempts",
-                                  "lockExpiresAt": "2026-05-28T10:30:00.000Z",
-                                  "secondsRemaining": 1247
-                                }
-```
-
----
-
-### Endpoint 5: POST /api/v1/auth/refresh
-
-**Auth required:** No (refresh token is the credential)
-
-**Request:**
-```json
-{ "refreshToken": "a3f2b1c4...128-hex-chars..." }
-```
-
-**Success Response — 200 OK:**
-```json
-{
-  "success": true,
-  "message": "Access token refreshed successfully.",
-  "data": {
-    "accessToken": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
-    "refreshToken": "b4c3d2e1...new-128-hex-chars...",
-    "accessTokenExpiresAt": "2026-05-28T10:30:00.000Z",
-    "refreshTokenExpiresAt": "2026-06-04T10:15:00.000Z"
-  },
-  "traceId": "..."
-}
-```
-
-Both tokens are new. The old refresh token is deleted (rotation).
-
-**Error Responses:**
-```
-400 VALIDATION_ERROR         → missing/malformed refreshToken
-401 INVALID_REFRESH_TOKEN    → token not found (deleted after rotation or never existed)
-401 REFRESH_TOKEN_EXPIRED    → token found but expired
-401 ACCOUNT_INACTIVE         → user account deactivated
-```
-
----
-
-### Endpoint 6: POST /api/v1/auth/logout
-
-**Auth required:** Yes (Bearer JWT in Authorization header)
-
-**Request body:** Empty `{}`
-
-**What happens internally:**
-1. `jti` extracted from verified JWT (Gateway already verified it, User Service gets `X-User-Jti` header)
-2. Refresh token for this session deleted from DB (client should send refresh token in body for accurate deletion, or delete by userId + device fingerprint)
-3. `jti` written to Redis blacklist with TTL = remaining token lifetime
-
-**Success Response — 200 OK:**
-```json
-{
-  "success": true,
-  "message": "Logged out successfully.",
-  "data": null,
-  "traceId": "..."
-}
-```
-
----
-
-### Endpoint 7: POST /api/v1/auth/logout-all
-
-**Auth required:** Yes (Bearer JWT)
-
-**Request body:** Empty `{}`
-
-**What happens:**
-- ALL refresh tokens for this user deleted from DB
-- Current JWT's `jti` added to Redis blacklist
-- User must log in again on all devices
-
-**Success Response — 200 OK:**
-```json
-{
-  "success": true,
-  "message": "Logged out from all sessions successfully.",
-  "data": { "sessionsTerminated": 3 },
-  "traceId": "..."
-}
-```
-
----
-
-### Endpoint 8: GET /api/v1/auth/me
-
-**Auth required:** Yes (Bearer JWT)
-
-**Success Response — 200 OK:**
-```json
-{
-  "success": true,
-  "message": "Profile retrieved successfully.",
-  "data": {
-    "userId": "7b58c281-a5bf-4050-a922-a72a1cd40a92",
-    "name": "John Doe",
-    "email": "john.doe@example.com",
-    "role": "CUSTOMER",
-    "loyaltyTier": "GOLD",
-    "bookingCount": 7,
-    "emailVerified": true,
-    "isActive": true,
-    "lastLoginAt": "2026-05-28T09:00:00.000Z",
-    "createdAt": "2025-01-15T08:30:00.000Z"
-  },
-  "traceId": "..."
-}
-```
-
-Never return: `passwordHash`, token fields, `failedLoginAttempts`, `lockedUntil`.
-
----
-
-### Endpoint 9: PUT /api/v1/auth/me
-
-**Auth required:** Yes (Bearer JWT)
-
-**Request:**
-```json
-{ "name": "John Smith" }
-```
-
-**Validations:** `name`: string, min 2, max 100, trim
-
-**Success Response — 200 OK:**
-```json
-{
-  "success": true,
-  "message": "Profile updated successfully.",
-  "data": {
-    "userId": "...",
-    "name": "John Smith",
-    "email": "john.doe@example.com",
-    "role": "CUSTOMER",
-    "loyaltyTier": "GOLD"
-  },
-  "traceId": "..."
-}
-```
-
----
-
-### Endpoint 10: POST /api/v1/auth/change-password
-
-**Auth required:** Yes (Bearer JWT)
-
-**Request:**
-```json
-{
-  "currentPassword": "SecurePass1!",
-  "newPassword": "EvenBetter2@"
-}
-```
-
-**Success Response — 200 OK:**
-```json
-{
-  "success": true,
-  "message": "Password changed successfully. Please log in again on your other devices.",
-  "data": null,
-  "traceId": "..."
-}
-```
-
-**Error Responses:**
-```
-400 VALIDATION_ERROR        → new password fails complexity rules
-400 SAME_PASSWORD           → new password identical to current
-401 WRONG_CURRENT_PASSWORD  → bcrypt.compare failed
-```
-
----
-
-### Endpoint 11: POST /api/v1/auth/forgot-password
-
-**Auth required:** No
-
-**Request:**
-```json
-{ "email": "john.doe@example.com" }
-```
-
-**Success Response — 200 OK (always, regardless of whether email exists):**
-```json
-{
-  "success": true,
-  "message": "If an account with that email exists, a password reset link has been sent.",
-  "data": null,
-  "traceId": "..."
-}
-```
-
-This response is always identical. Never reveal whether an email is registered.
-
----
-
-### Endpoint 12: POST /api/v1/auth/reset-password
-
-**Auth required:** No
-
-**Request:**
-```json
-{
-  "token": "a3f2b1c4...64-hex-chars...",
-  "newPassword": "NewSecurePass3#"
-}
-```
-
-**Success Response — 200 OK:**
-```json
-{
-  "success": true,
-  "message": "Password reset successfully. Please log in with your new password.",
-  "data": null,
-  "traceId": "..."
-}
-```
-
-**Error Responses:**
-```
-400 INVALID_RESET_TOKEN     → token not found or expired
-400 VALIDATION_ERROR        → newPassword fails complexity rules
-```
-
----
-
-### Endpoint 13: GET /.well-known/jwks.json
-
-**Auth required:** No  
-**Path note:** This is NOT under `/api/v1/` prefix — it is a well-known URI standard
-
-**Success Response — 200 OK:**
-```json
-{
-  "keys": [
+    ```
+*   **Behavior**: Creates a deactivated `User` and `UserProfile` in a single transaction. Generates a secure, cryptographically random **6-digit numeric OTP** (`email_verify_token`), hashes it using SHA-256, saves it, and emits a `USER_REGISTERED` event to Kafka via the outbox pattern.
+*   **Success Response — 201 Created**:
+    ```json
     {
-      "kty": "RSA",
-      "use": "sig",
-      "alg": "RS256",
-      "kid": "skyhub-key-v1",
-      "n": "0vx7agoebGcQSuu...",
-      "e": "AQAB"
+      "success": true,
+      "message": "Registration successful. Please enter the 6-digit OTP sent to your email.",
+      "data": {
+        "userId": "7b58c281-a5bf-4050-a922-a72a1cd40a92",
+        "email": "john.doe@example.com",
+        "name": "John Doe",
+        "emailVerified": false
+      },
+      "traceId": "tr-ka7e12mx-9a7x12"
     }
-  ]
-}
-```
+    ```
+*   **Error Response — 400 Bad Request (Validation Failure)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 400,
+        "name": "VALIDATION_ERROR",
+        "message": "Validation failed",
+        "details": [
+          { "field": "email", "message": "Invalid email format" },
+          { "field": "password", "message": "Password must be at least 8 characters" }
+        ]
+      },
+      "traceId": "tr-ka7e12mx-9a7x12"
+    }
+    ```
+*   **Error Response — 409 Conflict (Duplicate Email)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 409,
+        "name": "CONFLICT",
+        "message": "An account with this email address is already registered."
+      },
+      "traceId": "tr-ka7e12mx-9a7x12"
+    }
+    ```
 
-**Cache headers:** `Cache-Control: public, max-age=86400` — clients/gateways may cache this for 24 hours.
+#### Endpoint 2: POST /api/v1/auth/verify-email
+*   **Auth required**: No
+*   **Request Body**:
+    ```json
+    {
+      "email": "john.doe@example.com",
+      "code": "482910"
+    }
+    ```
+*   **Behavior**: Computes SHA-256 of the code, verifies it matches the stored `email_verify_token` for the user, checks that token has not expired, and updates the user's status to `emailVerified = true`.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "Email verified successfully. You can now log in.",
+      "data": null,
+      "traceId": "tr-ab7x82ld-291a"
+    }
+    ```
+*   **Error Response — 400 Bad Request (Invalid/Expired OTP)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 400,
+        "name": "INVALID_VERIFY_CODE",
+        "message": "The verification code is incorrect or has expired. Please request a new code."
+      },
+      "traceId": "tr-ab7x82ld-291a"
+    }
+    ```
+
+#### Endpoint 3: POST /api/v1/auth/resend-verification
+*   **Auth required**: No
+*   **Request Body**:
+    ```json
+    { "email": "john.doe@example.com" }
+    ```
+*   **Behavior**: Generates a new 6-digit OTP and resends it. Rate-limited to 1 request per 2 minutes per account to prevent email bombing. Returns a decoy message if the email does not exist.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "If this account is unverified, a new 6-digit code has been dispatched.",
+      "data": null,
+      "traceId": "tr-mn8x71ba-8172"
+    }
+    ```
+*   **Error Response — 429 Too Many Requests (Rate Limited)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 429,
+        "name": "RATE_LIMIT_EXCEEDED",
+        "message": "Too many requests. Please wait 2 minutes before requesting another verification code."
+      },
+      "traceId": "tr-mn8x71ba-8172"
+    }
+    ```
+
+#### Endpoint 4: POST /api/v1/auth/login
+*   **Auth required**: No
+*   **Request Body**:
+    ```json
+    {
+      "email": "john.doe@example.com",
+      "password": "SecurePassword1!"
+    }
+    ```
+*   **Behavior**: 
+    1. Looks up user. If locked (`locked_until > NOW()`), returns `423 Locked`.
+    2. Runs timing-safe Bcrypt password comparison. 
+    3. If failed, increments lockout counters (locks at 5).
+    4. If successful, checks if user has `mfa_enabled = true`. 
+       - If **MFA Active**: Returns a short-lived temporary ticket token and sets `mfaRequired = true`.
+       - If **No MFA**: Signs the RS256 Access Token (attaching dynamic scopes/permissions in claims) and writes a new SHA-256 refresh token hash to the DB.
+*   **Success Response (MFA Inactive) — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "Login successful.",
+      "data": {
+        "mfaRequired": false,
+        "user": {
+          "userId": "7b58c281-a5bf-4050-a922-a72a1cd40a92",
+          "email": "john.doe@example.com",
+          "fullName": "John Doe",
+          "loyaltyTier": "SILVER"
+        },
+        "tokens": {
+          "accessToken": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
+          "refreshToken": "a3f2b1c4...128-hex-chars...",
+          "expiresAt": 900
+        }
+      },
+      "traceId": "tr-kl89x12a-381a"
+    }
+    ```
+*   **Success Response (MFA Required) — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "Step-up Multi-Factor Authentication required.",
+      "data": {
+        "mfaRequired": true,
+        "mfaTicket": "temp_mfa_token_xyz123"
+      },
+      "traceId": "tr-kl89x12a-381a"
+    }
+    ```
+*   **Error Response — 401 Unauthorized (Invalid Credentials)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 401,
+        "name": "UNAUTHORIZED",
+        "message": "Invalid email address or password. Please try again."
+      },
+      "traceId": "tr-kl89x12a-381a"
+    }
+    ```
+*   **Error Response — 401 Unauthorized (Email Unverified)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 401,
+        "name": "EMAIL_NOT_VERIFIED",
+        "message": "Your email address is not verified. Please verify your email before logging in."
+      },
+      "traceId": "tr-kl89x12a-381a"
+    }
+    ```
+*   **Error Response — 423 Locked (Brute Force Protection)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 423,
+        "name": "ACCOUNT_LOCKED",
+        "message": "Account locked due to 5 consecutive failed login attempts. Please try again in 30 minutes.",
+        "details": [
+          { "field": "lockedUntil", "message": "2026-05-30T16:00:00.000Z" },
+          { "field": "secondsRemaining", "message": "1800" }
+        ]
+      },
+      "traceId": "tr-kl89x12a-381a"
+    }
+    ```
+
+#### Endpoint 5: POST /api/v1/auth/refresh
+*   **Auth required**: No
+*   **Request Body**:
+    ```json
+    { "refreshToken": "a3f2b1c4...128-hex-chars..." }
+    ```
+*   **Behavior**: Looks up the SHA-256 hash of the token. If found, deletes it, signs a fresh access token, generates a new refresh token, and inserts the new hash (Token Rotation).
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "Session token rotated successfully.",
+      "data": {
+        "accessToken": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
+        "refreshToken": "b4c3d2e1...new-128-hex-chars..."
+      },
+      "traceId": "tr-rf82x91b-82ba"
+    }
+    ```
+*   **Error Response — 401 Unauthorized (Invalid/Stolen Session)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 401,
+        "name": "INVALID_REFRESH_TOKEN",
+        "message": "The session has expired, been terminated, or is invalid. Please log in again."
+      },
+      "traceId": "tr-rf82x91b-82ba"
+    }
+    ```
+
+#### Endpoint 6: POST /api/v1/auth/logout
+*   **Auth required**: Yes (Bearer Access Token)
+*   **Request Body**:
+    ```json
+    { "refreshToken": "a3f2b1c4..." }
+    ```
+*   **Behavior**: Deletes the specific refresh token hash from the database. Writes the Access Token's unique `jti` to the Redis blacklist with a TTL matching its remaining time to prevent reuse.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "Logged out successfully.",
+      "data": null,
+      "traceId": "tr-lo7x81ca-92ba"
+    }
+    ```
+
+#### Endpoint 7: POST /api/v1/auth/logout-all
+*   **Auth required**: Yes (Bearer Access Token)
+*   **Behavior**: Deletes ALL active refresh tokens for this user from the database. Blacklists current `jti` in Redis.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "Logged out from all session devices successfully.",
+      "data": null,
+      "traceId": "tr-lo9y12ca-1029"
+    }
+    ```
+
+#### Endpoint 8: GET /api/v1/auth/me
+*   **Auth required**: Yes (Bearer Access Token)
+*   **Behavior**: Fetches the profile from the `user_profiles` table. Strictly isolates data; **never** queries or exposes credential hashes or security parameters.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "Profile retrieved successfully.",
+      "data": {
+        "userId": "7b58c281-a5bf-4050-a922-a72a1cd40a92",
+        "email": "john.doe@example.com",
+        "profile": {
+          "fullName": "John Doe",
+          "loyaltyTier": "SILVER",
+          "bookingCount": 0
+        }
+      },
+      "traceId": "tr-me8a21kb-921a"
+    }
+    ```
+*   **Error Response — 401 Unauthorized (Expired JWT)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 401,
+        "name": "TOKEN_EXPIRED",
+        "message": "Authentication token has expired. Please refresh your session."
+      },
+      "traceId": "tr-me8a21kb-921a"
+    }
+    ```
+
+#### Endpoint 9: PUT /api/v1/auth/me
+*   **Auth required**: Yes (Bearer Access Token)
+*   **Request Body**:
+    ```json
+    { "fullName": "John Smith" }
+    ```
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "Profile updated successfully.",
+      "data": {
+        "fullName": "John Smith"
+      },
+      "traceId": "tr-up82x1ab-812a"
+    }
+    ```
+
+#### Endpoint 10: POST /api/v1/auth/change-password
+*   **Auth required**: Yes (Bearer Access Token)
+*   **Request Body**:
+    ```json
+    {
+      "currentPassword": "SecurePassword1!",
+      "newPassword": "EvenMoreSecure2@"
+    }
+    ```
+*   **Behavior**: Checks new password meets criteria, runs `bcrypt.compare` against the old password. On match, hashes the new password and forces a logout of all other devices (`logout-all` logic).
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "Password changed successfully. All other devices have been signed out.",
+      "data": null,
+      "traceId": "tr-cp89x21b-89ba"
+    }
+    ```
+*   **Error Response — 400 Bad Request (Same Password)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 400,
+        "name": "BUSINESS_RULE_VIOLATION",
+        "message": "New password cannot be identical to your current password."
+      },
+      "traceId": "tr-cp89x21b-89ba"
+    }
+    ```
+*   **Error Response — 401 Unauthorized (Wrong Current Password)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 401,
+        "name": "UNAUTHORIZED",
+        "message": "The current password provided is incorrect."
+      },
+      "traceId": "tr-cp89x21b-89ba"
+    }
+    ```
+
+#### Endpoint 11: POST /api/v1/auth/forgot-password
+*   **Auth required**: No
+*   **Request Body**:
+    ```json
+    { "email": "john.doe@example.com" }
+    ```
+*   **Behavior**: Generates a 6-digit password recovery OTP, hashes it, saves it to `reset_token`, and emails it to the user. Always returns `200` to prevent user enumeration.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "If an account with that email exists, a password reset code has been sent.",
+      "data": null,
+      "traceId": "tr-fp82x91a-810a"
+    }
+    ```
+
+#### Endpoint 12: POST /api/v1/auth/reset-password
+*   **Auth required**: No
+*   **Request Body**:
+    ```json
+    {
+      "email": "john.doe@example.com",
+      "code": "812903",
+      "newPassword": "SuperNewPassword3#"
+    }
+    ```
+*   **Behavior**: Computes SHA-256 of the recovery code, matches it, verifies expiration, and updates the user's password hash in the database.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "Password reset successfully. You can now log in.",
+      "data": null,
+      "traceId": "tr-rp291xlb-918a"
+    }
+    ```
+*   **Error Response — 400 Bad Request (Invalid OTP)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 400,
+        "name": "INVALID_RESET_TOKEN",
+        "message": "The password reset code is incorrect, already used, or has expired."
+      },
+      "traceId": "tr-rp291xlb-918a"
+    }
+    ```
 
 ---
 
-### Endpoint 14: GET /health
+### 5.2 Device-Aware Session Management Endpoints (Auth Required)
 
-**Auth required:** No
+#### Endpoint 13: GET /api/v1/auth/sessions
+*   **Behavior**: Reads all active `RefreshToken` entries for this user. Uses `User-Agent` headers parsed cleanly into device/browser metadata.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "Active sessions retrieved successfully.",
+      "data": [
+        {
+          "sessionId": "4b91-a20c-ef92",
+          "device": "Firefox / Ubuntu Linux",
+          "ipAddress": "192.168.1.102",
+          "isCurrent": true,
+          "createdAt": "2026-05-30T15:30:00.000Z"
+        },
+        {
+          "sessionId": "9a38-c208-d204",
+          "device": "Safari / iPhone 15 Pro",
+          "ipAddress": "172.56.21.9",
+          "isCurrent": false,
+          "createdAt": "2026-05-28T10:15:00.000Z"
+        }
+      ],
+      "traceId": "tr-se189kab-9182"
+    }
+    ```
 
-**Healthy Response — 200 OK:**
-```json
-{
-  "status": "healthy",
-  "service": "user-service",
-  "version": "1.0.0",
-  "timestamp": "2026-05-28T10:00:00.000Z",
-  "checks": {
-    "database": "ok",
-    "redis":    "ok",
-    "kafka":    "ok"
-  }
-}
-```
+#### Endpoint 14: DELETE /api/v1/auth/sessions/:sessionId
+*   **Behavior**: Deletes the specified refresh token session by ID. If successful, that device is forced to log out immediately on its next refresh attempt.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "Session terminated successfully.",
+      "data": null,
+      "traceId": "tr-sed291ab-812a"
+    }
+    ```
+*   **Error Response — 403 Forbidden (Unauthorized Revocation)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 403,
+        "name": "FORBIDDEN",
+        "message": "You do not have permission to terminate this session."
+      },
+      "traceId": "tr-sed291ab-812a"
+    }
+    ```
+*   **Error Response — 404 Not Found (Invalid Session ID)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 404,
+        "name": "NOT_FOUND",
+        "message": "The session ID requested was already terminated or does not exist."
+      },
+      "traceId": "tr-sed291ab-812a"
+    }
+    ```
 
-**Degraded Response — 503 Service Unavailable:**
-```json
-{
-  "status": "degraded",
-  "service": "user-service",
-  "timestamp": "2026-05-28T10:00:00.000Z",
-  "checks": {
-    "database": "ok",
-    "redis":    "error: ECONNREFUSED",
-    "kafka":    "ok"
-  }
-}
-```
+---
+
+### 5.3 Step-Up Multi-Factor Authentication Endpoints (Auth Required)
+
+#### Endpoint 15: POST /api/v1/auth/mfa/enable
+*   **Behavior**: Generates a standard Base32 secret key and creates a standard QR code URL.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "MFA configuration initialized. Scan the QR code with your authenticator app.",
+      "data": {
+        "secret": "JBSWY3DPEHPK3PXP",
+        "qrCodeUrl": "otpauth://totp/SkyHub:john.doe@example.com?secret=JBSWY3DPEHPK3PXP&issuer=SkyHub"
+      },
+      "traceId": "tr-mfa8x21a-98ba"
+    }
+    ```
+
+#### Endpoint 16: POST /api/v1/auth/mfa/verify
+*   **Request Body**:
+    ```json
+    { "code": "382910" }
+    ```
+*   **Behavior**: Validates the 6-digit TOTP token using the stored secret key. Once confirmed, permanently updates user settings to `mfa_enabled = true`.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "MFA enabled and activated successfully.",
+      "data": null,
+      "traceId": "tr-mfav82ab-81ba"
+    }
+    ```
+*   **Error Response — 400 Bad Request (Invalid Verification Code)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 400,
+        "name": "BUSINESS_RULE_VIOLATION",
+        "message": "The authenticator code is incorrect. Verification failed."
+      },
+      "traceId": "tr-mfav82ab-81ba"
+    }
+    ```
+
+#### Endpoint 17: POST /api/v1/auth/mfa/login-verify
+*   **Request Body**:
+    ```json
+    {
+      "mfaTicket": "temp_mfa_token_xyz123",
+      "code": "482910"
+    }
+    ```
+*   **Behavior**: Validates the step-up login token. If the TOTP code matches the user's authenticator secret, issues the permanent Access and Refresh tokens.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "Multi-factor verification successful. Welcome back.",
+      "data": {
+        "tokens": {
+          "accessToken": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
+          "refreshToken": "a3f2b1c4..."
+        }
+      },
+      "traceId": "tr-mfal82ab-289a"
+    }
+    ```
+*   **Error Response — 401 Unauthorized (Invalid Step-up Ticket)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 401,
+        "name": "UNAUTHORIZED",
+        "message": "The step-up login ticket is invalid, expired, or compromised. Please restart login."
+      },
+      "traceId": "tr-mfal82ab-289a"
+    }
+    ```
+*   **Error Response — 401 Unauthorized (Invalid TOTP Code)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 401,
+        "name": "UNAUTHORIZED",
+        "message": "The authenticator code is incorrect. Access denied."
+      },
+      "traceId": "tr-mfal82ab-289a"
+    }
+    ```
+
+---
+
+### 5.4 Administrative RBAC Endpoints (Requires `SUPER_ADMIN` Role)
+
+These routes are protected by the dynamic RBAC middleware. The Gateway checks that the user's JWT has both the role `'SUPER_ADMIN'` and the specific permissions string before allowing access.
+
+#### Endpoint 18: GET /api/v1/admin/users
+*   **Behavior**: Lists all registered accounts in the system with full-name profiles, loyalty state, active lockout settings, and assigned roles. Fully paginated.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "Accounts retrieved successfully.",
+      "data": [
+        {
+          "userId": "7b58c281-a5bf-4050-a922-a72a1cd40a92",
+          "email": "john.doe@example.com",
+          "isActive": true,
+          "profile": {
+            "fullName": "John Doe",
+            "loyaltyTier": "SILVER"
+          },
+          "roles": ["CUSTOMER", "FLIGHT_ADMIN"]
+        }
+      ],
+      "traceId": "tr-ad82x1ab-98ba"
+    }
+    ```
+*   **Error Response — 403 Forbidden (Insufficient Privilege)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 403,
+        "name": "FORBIDDEN",
+        "message": "You do not have the required administrative permissions ('users:read') to access this resource."
+      },
+      "traceId": "tr-ad82x1ab-98ba"
+    }
+    ```
+
+#### Endpoint 19: PUT /api/v1/admin/users/:userId/roles
+*   **Request Body**:
+    ```json
+    { "roles": ["CUSTOMER", "FLIGHT_ADMIN"] }
+    ```
+*   **Behavior**: Updates the join table `UserRole` mappings. Revokes existing roles and binds the new ones, recalculating and updating the user's token permissions pool dynamically.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "success": true,
+      "message": "User authorization roles updated successfully.",
+      "data": null,
+      "traceId": "tr-adr82xa-81ba"
+    }
+    ```
+*   **Error Response — 400 Bad Request (Invalid Roles Input)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "statusCode": 400,
+        "name": "VALIDATION_ERROR",
+        "message": "The role array provided contains invalid role names."
+      },
+      "traceId": "tr-adr82xa-81ba"
+    }
+    ```
+*   **Error Response — 404 Not Found (User Not Found)**:
+    ```json
+    {
+      "success": false,
+      "error": {
+        "code": "NOT_FOUND",
+        "message": "The target user ID requested for role updates does not exist."
+      },
+      "traceId": "tr-adr82xa-81ba"
+    }
+    ```
+
+---
+
+### 5.5 Cluster Metadata & Observability
+
+#### Endpoint 20: GET /.well-known/jwks.json
+*   **Auth required**: No  
+*   **Path note**: Public key directory.
+*   **Success Response — 200 OK**:
+    ```json
+    {
+      "keys": [
+        {
+          "kty": "RSA",
+          "use": "sig",
+          "alg": "RS256",
+          "kid": "skyhub-key-v1",
+          "n": "0vx7agoebGcQSuu...",
+          "e": "AQAB"
+        }
+      ]
+    }
+    ```
+
+#### Endpoint 21: GET /health
+*   **Auth required**: No
+*   **Success Response (Healthy) — 200 OK**:
+    ```json
+    {
+      "status": "healthy",
+      "service": "user-service",
+      "version": "1.0.0",
+      "timestamp": "2026-05-28T10:00:00.000Z",
+      "checks": {
+        "database": "ok",
+        "redis":    "ok",
+        "kafka":    "ok"
+      }
+    }
+    ```
+
+---
 
 ---
 
@@ -1128,6 +1556,12 @@ const passwordSchema = z
     'Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character'
   );
 
+// 6-digit numeric code validator helper
+const otpCodeSchema = z
+  .string()
+  .length(6, 'Verification code must be exactly 6 digits')
+  .regex(/^\d{6}$/, 'Verification code must contain only numbers');
+
 export const RegisterSchema = z.object({
   name:     z.string().trim().min(2, 'Name must be at least 2 characters').max(100),
   email:    z.string().trim().toLowerCase().email('Invalid email format'),
@@ -1144,7 +1578,8 @@ export const RefreshTokenSchema = z.object({
 });
 
 export const VerifyEmailSchema = z.object({
-  token: z.string().length(64, 'Invalid token format'),
+  email: z.string().trim().toLowerCase().email(),
+  code:  otpCodeSchema,
 });
 
 export const ResendVerificationSchema = z.object({
@@ -1156,7 +1591,8 @@ export const ForgotPasswordSchema = z.object({
 });
 
 export const ResetPasswordSchema = z.object({
-  token:       z.string().min(1, 'Token is required'),
+  email:       z.string().trim().toLowerCase().email(),
+  code:        otpCodeSchema,
   newPassword: passwordSchema,
 });
 
@@ -1166,7 +1602,24 @@ export const ChangePasswordSchema = z.object({
 });
 
 export const UpdateProfileSchema = z.object({
-  name: z.string().trim().min(2).max(100),
+  fullName: z.string().trim().min(2, 'Full name must be at least 2 characters').max(100),
+});
+
+// ─── MFA VALIDATION SCHEMAS ──────────────────────────────────────────────────
+export const MfaVerifySchema = z.object({
+  code: otpCodeSchema,
+});
+
+export const MfaLoginVerifySchema = z.object({
+  mfaTicket: z.string().min(1, 'MFA Step-up ticket is required'),
+  code:      otpCodeSchema,
+});
+
+// ─── ADMINISTRATIVE VALIDATION SCHEMAS ────────────────────────────────────────
+export const AdminUpdateRolesSchema = z.object({
+  roles: z.array(z.enum(['CUSTOMER', 'FLIGHT_ADMIN', 'SUPER_ADMIN'], {
+    invalid_type_error: 'Roles must only contain CUSTOMER, FLIGHT_ADMIN, or SUPER_ADMIN'
+  })).min(1, 'At least one role must be assigned'),
 });
 
 export type RegisterInput             = z.infer<typeof RegisterSchema>;
@@ -1178,6 +1631,9 @@ export type ForgotPasswordInput       = z.infer<typeof ForgotPasswordSchema>;
 export type ResetPasswordInput        = z.infer<typeof ResetPasswordSchema>;
 export type ChangePasswordInput       = z.infer<typeof ChangePasswordSchema>;
 export type UpdateProfileInput        = z.infer<typeof UpdateProfileSchema>;
+export type MfaVerifyInput            = z.infer<typeof MfaVerifySchema>;
+export type MfaLoginVerifyInput       = z.infer<typeof MfaLoginVerifySchema>;
+export type AdminUpdateRolesInput     = z.infer<typeof AdminUpdateRolesSchema>;
 ```
 
 ---
@@ -1188,7 +1644,7 @@ export type UpdateProfileInput        = z.infer<typeof UpdateProfileSchema>;
 services/user-service/
 │
 ├── prisma/
-│   ├── schema.prisma              ← All 3 models: User, RefreshToken, OutboxEvent
+│   ├── schema.prisma              ← Decoupled IAM: User, UserProfile, Role, Permission, join tables, RefreshToken, OutboxEvent
 │   ├── migrations/                ← Auto-generated by `prisma migrate dev`
 │   │   └── 20260528_init/
 │   │       └── migration.sql
@@ -1551,7 +2007,7 @@ Work through these steps in order. Complete and validate each step before moving
 
 ```typescript
 import 'dotenv/config';   // seed.ts runs standalone — must load .env itself
-import { PrismaClient, UserRole, LoyaltyTier } from '@prisma/client';
+import { PrismaClient } from '@prisma/client';
 import bcrypt from 'bcrypt';
 
 const prisma = new PrismaClient();
@@ -1559,37 +2015,128 @@ const prisma = new PrismaClient();
 async function seed() {
   const rounds = parseInt(process.env.BCRYPT_ROUNDS ?? '12');
 
+  console.log('Seeding security roles & permissions...');
+
+  // 1. Create or Find roles
+  const superAdminRole = await prisma.role.upsert({
+    where: { name: 'SUPER_ADMIN' },
+    update: {},
+    create: { name: 'SUPER_ADMIN', description: 'System super administrator with full system controls' }
+  });
+
+  const flightAdminRole = await prisma.role.upsert({
+    where: { name: 'FLIGHT_ADMIN' },
+    update: {},
+    create: { name: 'FLIGHT_ADMIN', description: 'Flight operation administrator' }
+  });
+
+  const customerRole = await prisma.role.upsert({
+    where: { name: 'CUSTOMER' },
+    update: {},
+    create: { name: 'CUSTOMER', description: 'Standard flying passenger account' }
+  });
+
+  // 2. Seed default granular permissions
+  const permissionsList = [
+    { name: 'flights:read', desc: 'Allows viewing active flight schedules' },
+    { name: 'flights:create', desc: 'Allows adding new flights to schedules' },
+    { name: 'flights:delete', desc: 'Allows deleting/cancelling scheduled flights' },
+    { name: 'bookings:read', desc: 'Allows reading flight passenger reservations' },
+    { name: 'users:read', desc: 'Allows listing user registry for security reviews' },
+    { name: 'users:ban', desc: 'Allows deactivating violating user accounts' }
+  ];
+
+  for (const perm of permissionsList) {
+    await prisma.permission.upsert({
+      where: { name: perm.name },
+      update: {},
+      create: { name: perm.name, description: perm.desc }
+    });
+  }
+
+  // 3. Link permissions to roles
+  const superAdminPerms = ['flights:read', 'flights:create', 'flights:delete', 'bookings:read', 'users:read', 'users:ban'];
+  const flightAdminPerms = ['flights:read', 'flights:create', 'bookings:read'];
+  const customerPerms = ['flights:read', 'bookings:read'];
+
+  const bindPerms = async (roleName: string, permNames: string[]) => {
+    const role = await prisma.role.findUnique({ where: { name: roleName } });
+    if (!role) return;
+
+    for (const name of permNames) {
+      const perm = await prisma.permission.findUnique({ where: { name } });
+      if (perm) {
+        await prisma.rolePermission.upsert({
+          where: { roleId_permissionId: { roleId: role.id, permissionId: perm.id } },
+          update: {},
+          create: { roleId: role.id, permissionId: perm.id }
+        });
+      }
+    }
+  };
+
+  await bindPerms('SUPER_ADMIN', superAdminPerms);
+  await bindPerms('FLIGHT_ADMIN', flightAdminPerms);
+  await bindPerms('CUSTOMER', customerPerms);
+
+  console.log('Seeding pre-verified administrator accounts...');
+
   const admins = [
     {
       name:  process.env.SUPER_ADMIN_NAME  ?? 'Super Admin',
       email: process.env.SUPER_ADMIN_EMAIL ?? 'superadmin@skyhub.com',
-      pass:  process.env.SUPER_ADMIN_PASSWORD ?? '',
-      role:  UserRole.SUPER_ADMIN,
+      pass:  process.env.SUPER_ADMIN_PASSWORD ?? 'SuperAdmin1!@#',
+      roleId: superAdminRole.id,
     },
     {
       name:  process.env.FLIGHT_ADMIN_NAME  ?? 'Flight Admin',
       email: process.env.FLIGHT_ADMIN_EMAIL ?? 'flightadmin@skyhub.com',
-      pass:  process.env.FLIGHT_ADMIN_PASSWORD ?? '',
-      role:  UserRole.FLIGHT_ADMIN,
+      pass:  process.env.FLIGHT_ADMIN_PASSWORD ?? 'FlightAdmin1!@#',
+      roleId: flightAdminRole.id,
     },
   ];
 
   for (const admin of admins) {
     const existing = await prisma.user.findUnique({ where: { email: admin.email } });
-    if (existing) { console.log(`${admin.email} already exists — skipping`); continue; }
+    if (existing) {
+      console.log(`${admin.email} already exists — skipping seeding`);
+      continue;
+    }
 
     const passwordHash = await bcrypt.hash(admin.pass, rounds);
-    await prisma.user.create({
-      data: {
-        name: admin.name, email: admin.email, passwordHash,
-        role: admin.role, loyaltyTier: LoyaltyTier.SILVER,
-        isActive: true, emailVerified: true,  // Admins pre-verified
-      },
+    
+    // Create pre-verified user credentials, profile, and dynamic role link in a transaction
+    await prisma.$transaction(async (tx) => {
+      const user = await tx.user.create({
+        data: {
+          email: admin.email,
+          passwordHash,
+          isActive: true,
+          emailVerified: true
+        }
+      });
+
+      await tx.userProfile.create({
+        data: {
+          userId: user.id,
+          fullName: admin.name,
+          loyaltyTier: 'SILVER'
+        }
+      });
+
+      await tx.userRole.create({
+        data: {
+          userId: user.id,
+          roleId: admin.roleId
+        }
+      });
     });
-    console.log(`Created ${admin.role}: ${admin.email}`);
+
+    console.log(`Created administrator identity [${admin.email}]`);
   }
 
   await prisma.$disconnect();
+  console.log('Seeding successfully completed!');
 }
 
 seed().catch(console.error);
@@ -1723,23 +2270,21 @@ const transporter = nodemailer.createTransport({
 });
 
 export const emailService = {
-  async sendVerificationEmail(to: string, rawToken: string): Promise<void> {
-    const link = `${env.APP_BASE_URL}/verify-email?token=${rawToken}`;
+  async sendVerificationEmail(to: string, code: string): Promise<void> {
     await transporter.sendMail({
       from:    env.EMAIL_FROM,
       to,
       subject: 'Verify your SkyHub account',
-      html:    `<p>Click <a href="${link}">here</a> to verify your email. This link expires in 24 hours.</p>`,
+      html:    `<p>Your SkyHub email verification code is: <strong>${code}</strong>. This code is valid for 10 minutes.</p>`,
     });
   },
 
-  async sendPasswordResetEmail(to: string, rawToken: string): Promise<void> {
-    const link = `${env.APP_BASE_URL}/reset-password?token=${rawToken}`;
+  async sendPasswordResetEmail(to: string, code: string): Promise<void> {
     await transporter.sendMail({
       from:    env.EMAIL_FROM,
       to,
       subject: 'Reset your SkyHub password',
-      html:    `<p>Click <a href="${link}">here</a> to reset your password. This link expires in 1 hour.</p>`,
+      html:    `<p>Your SkyHub password recovery code is: <strong>${code}</strong>. This code is valid for 10 minutes.</p>`,
     });
   },
 };
@@ -1871,48 +2416,11 @@ export interface JwtPayload {
 }
 ```
 
-> **`AppError` class** — `errorHandler.ts` imports `AppError` from `@skyhub/common-utils`, which is currently an empty stub. Before building the User Service you must implement this class in `packages/common-utils/src/index.ts`:
->
-> ```typescript
-> export class AppError extends Error {
->   constructor(
->     public readonly statusCode: number,
->     public readonly code: string,
->     message: string,
->   ) {
->     super(message);
->     this.name = 'AppError';
->   }
-> }
-> ```
-> Run `npm run build` from the `common-utils` package after adding this so the dist is up to date.
+> **`AppError` class & Global Handler** — Directly imported and re-exported from our compiled shared package `@skyhub/common-utils`.
 
 **`src/middlewares/errorHandler.ts`:**
 ```typescript
-import { Request, Response, NextFunction } from 'express';
-import { AppError } from '@skyhub/common-utils';
-import { logger } from '../config/logger.js';
-
-export function globalErrorHandler(
-  err: Error, req: Request, res: Response, _next: NextFunction
-) {
-  const traceId = req.headers['x-correlation-id'] as string ?? '';
-
-  if (err instanceof AppError) {
-    return res.status(err.statusCode).json({
-      success: false,
-      error: { code: err.code, message: err.message },
-      traceId,
-    });
-  }
-
-  logger.error({ err, traceId }, 'Unhandled error');
-  res.status(500).json({
-    success: false,
-    error: { code: 'INTERNAL_ERROR', message: 'An unexpected error occurred' },
-    traceId,
-  });
-}
+export { globalErrorHandler } from '@skyhub/common-utils';
 ```
 
 **Validation:** `npm run typecheck` — zero errors.
@@ -1964,26 +2472,26 @@ markFailed(id: string): Promise<void>
 
 **`src/services/token.service.ts`** — core logic:
 ```typescript
-// Signing
-async signAccessToken(userId, role, loyaltyTier): Promise<{ token: string, jti: string, expiresAt: Date }>
-  → jose.SignJWT({ sub: userId, role, loyaltyTier, jti: generateJti() })
+// Signing Access Tokens (attaching RBAC permissions dynamically)
+async signAccessToken(userId, role, loyaltyTier, permissions): Promise<{ token: string, jti: string, expiresAt: Date }>
+  → jose.SignJWT({ sub: userId, role, loyaltyTier, permissions, jti: generateJti() })
        .setProtectedHeader({ alg: 'RS256', kid: env.JWT_KEY_ID })
        .setExpirationTime('15m')
        .sign(privateKey)
 
-// Creating a refresh token record
+// Creating a refresh token record (retains device metadata for revocation)
 async createRefreshToken(userId, deviceInfo, ipAddress): Promise<string>
   → rawToken = generateRawToken(64)
   → tokenHash = hashToken(rawToken)
   → tokenRepository.create({ userId, tokenHash, deviceInfo, ipAddress, expiresAt: +7 days })
   → return rawToken  (only returned ONCE — caller sends to client)
 
-// Rotating a refresh token
+// Rotating a refresh token (Token Rotation protection)
 async rotateRefreshToken(oldTokenRaw, deviceInfo, ipAddress): Promise<{ newRaw, jti, accessToken, ... }>
   → hash = hashToken(oldTokenRaw)
   → existing = tokenRepository.findByHash(hash)
-  → if not found → throw AppError(401, INVALID_REFRESH_TOKEN)
-  → if expired → throw AppError(401, REFRESH_TOKEN_EXPIRED)
+  → if not found → throw AppError('Session invalid or terminated', 401, 'INVALID_REFRESH_TOKEN')
+  → if expired → throw AppError('Session expired', 401, 'INVALID_REFRESH_TOKEN')
   → tokenRepository.deleteById(existing.id)
   → return createRefreshToken + signAccessToken for existing.userId
 ```
@@ -1992,28 +2500,44 @@ async rotateRefreshToken(oldTokenRaw, deviceInfo, ipAddress): Promise<{ newRaw, 
 ```typescript
 async register(name, email, password): ...
   → check duplicate email
-  → hash password
-  → generate verification token + hash
-  → DB transaction: create user + create outbox event
-  → send verification email
-  → return user profile
+  → hash password using bcrypt (rounds=12)
+  → generate cryptographically secure 6-digit OTP: crypto.randomInt(100000, 999999).toString()
+  → SHA-256 hash the OTP code and set expiry to 10 minutes
+  → DB transaction: create user credentials + user profile (Silver tier) + outbox event (USER_REGISTERED)
+  → send verification email with raw 6-digit OTP
+  → return user profile metadata
 
 async login(email, password, deviceInfo, ip): ...
-  → find user by email (timing-safe)
-  → check is_active, email_verified, locked_until
-  → bcrypt.compare
-  → handle wrong password (increment counter, possibly lock)
-  → create access token + refresh token
+  → find user by email (timing-safe Bcrypt compare against dummy hash for non-existent users)
+  → check is_active, email_verified, locked_until (block if locked)
+  → bcrypt.compare(password, user.passwordHash)
+  → handle wrong password (increment counter, lock for 30 minutes on 5 consecutive failures)
+  → check if user has mfa_enabled = true
+       - If MFA enabled: generate temporary short-lived mfaTicket and return mfaRequired = true
+       - If MFA disabled: create and return final access token (with permissions scopes) + refresh token
   → update last_login_at
-  → write USER_LOGGED_IN to outbox
-  → return tokens + user
+  → write USER_LOGGED_IN event to outbox
 
-async verifyEmail(rawToken): ...
+async verifyEmail(email, code): ...
+  → look up user by email, verify code SHA-256 hash matches and is not expired
+  → update emailVerified = true in credentials table
+
 async forgotPassword(email): ...
-async resetPassword(rawToken, newPassword): ...
+  → generate 6-digit password recovery OTP, SHA-256 hash it, set 10-minute expiry
+  → email raw OTP code to user (always return success to prevent account enumeration)
+
+async resetPassword(email, code, newPassword): ...
+  → verify SHA-256 hash of recovery code matches email, verify newPassword complies with Zod rules
+  → update password hash in credentials database, clear reset tokens
+
 async changePassword(userId, currentPassword, newPassword): ...
+  → verify currentPassword match, verify newPassword is not identical, update password hash
+
 async logout(userId, jti, rawRefreshToken): ...
+  → delete specific refresh token hash, blacklist JWT jti in Redis (TTL = remaining exp)
+
 async logoutAll(userId, jti): ...
+  → delete all refresh tokens in DB for user, blacklist current jti in Redis
 ```
 
 **`src/services/loyalty.service.ts`:**
@@ -2066,7 +2590,7 @@ import * as schemas from './schemas/auth.schemas';
 
 const router = Router();
 
-// Public routes
+// ─── 1. STANDARD PUBLIC ROUTING ──────────────────────────────────────────────
 router.post('/register',            validate(schemas.RegisterSchema),           authController.register);
 router.post('/verify-email',        validate(schemas.VerifyEmailSchema),        authController.verifyEmail);
 router.post('/resend-verification', validate(schemas.ResendVerificationSchema), authController.resendVerification);
@@ -2075,12 +2599,25 @@ router.post('/refresh',             validate(schemas.RefreshTokenSchema),       
 router.post('/forgot-password',     validate(schemas.ForgotPasswordSchema),     authController.forgotPassword);
 router.post('/reset-password',      validate(schemas.ResetPasswordSchema),      authController.resetPassword);
 
-// Protected routes (require Gateway-injected auth headers)
+// ─── 2. STANDARD PROTECTED ROUTING (Identity Vault) ─────────────────────────
 router.post('/logout',              requireAuth, authController.logout);
 router.post('/logout-all',          requireAuth, authController.logoutAll);
 router.get('/me',                   requireAuth, authController.getProfile);
 router.put('/me',                   requireAuth, validate(schemas.UpdateProfileSchema), authController.updateProfile);
 router.post('/change-password',     requireAuth, validate(schemas.ChangePasswordSchema), authController.changePassword);
+
+// ─── 3. DEVICE-AWARE ACTIVE SESSION MANAGEMENT (Security Center) ────────────
+router.get('/sessions',             requireAuth, authController.listSessions);
+router.delete('/sessions/:sessionId',requireAuth, authController.revokeSession);
+
+// ─── 4. TIME-BASED MULTI-FACTOR AUTHENTICATION (TOTP MFA) ───────────────────
+router.post('/mfa/enable',          requireAuth, authController.enableMfa);
+router.post('/mfa/verify',          requireAuth, validate(schemas.MfaVerifySchema), authController.verifyMfa);
+router.post('/mfa/login-verify',    validate(schemas.MfaLoginVerifySchema), authController.loginVerifyMfa);
+
+// ─── 5. ADMINISTRATIVE CONTROL ROUTING (Dynamic RBAC Vault) ─────────────────
+router.get('/admin/users',          requireAuth, authController.adminListUsers);
+router.put('/admin/users/:userId/roles', requireAuth, validate(schemas.AdminUpdateRolesSchema), authController.adminUpdateUserRoles);
 
 export { router as authRouter };
 ```
@@ -2395,7 +2932,9 @@ describe('POST /api/v1/auth/register', () => {
     await request(app).post('/api/v1/auth/register').send(body);
     const res = await request(app).post('/api/v1/auth/register').send(body);
     expect(res.status).toBe(409);
-    expect(res.body.error.code).toBe('CONFLICT');
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.statusCode).toBe(409);
+    expect(res.body.error.name).toBe('CONFLICT');
   });
 
   it('returns 400 for weak password', async () => {
@@ -2403,23 +2942,27 @@ describe('POST /api/v1/auth/register', () => {
       name: 'Test', email: 'weak@example.com', password: 'weak',
     });
     expect(res.status).toBe(400);
-    expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    expect(res.body.success).toBe(false);
+    expect(res.body.error.statusCode).toBe(400);
+    expect(res.body.error.name).toBe('VALIDATION_ERROR');
   });
 });
 ```
 
 **Validation checklist before marking a step complete:**
-- `POST /register` → 201, no passwordHash in response
-- `POST /register` with same email → 409
-- `POST /login` before email verification → 401 EMAIL_NOT_VERIFIED
-- `POST /verify-email` with valid token → 200
-- `POST /login` after verification → 200 with access + refresh tokens
-- `GET /me` with valid Bearer token → 200 with profile
-- `POST /refresh` → 200 with NEW tokens (old refresh token no longer works)
-- `POST /logout` → 200, old access token now returns 401 at Gateway blacklist check
-- 5× wrong password → account locked for 30 min → 423 with `lockExpiresAt`
-- `POST /forgot-password` with non-existent email → still 200 (no enumeration)
-- `POST /reset-password` with valid token → 200, old password no longer works
+- `POST /register` → 201 Created, profiles populated inside `user_profiles`, email pre-deactivated.
+- `POST /register` with same email → 409 Conflict with `{ statusCode: 409, name: 'CONFLICT' }` payload.
+- `POST /login` before email verification → 401 Unauthorized with `{ statusCode: 401, name: 'EMAIL_NOT_VERIFIED' }`.
+- `POST /verify-email` with valid 6-digit OTP code → 200 OK.
+- `POST /login` after verification (MFA inactive) → 200 OK with rotated RS256 access and refresh tokens.
+- `POST /login` (MFA active) → 200 OK with `{ mfaRequired: true, mfaTicket: "..." }` redirect.
+- `GET /me` with Bearer token → 200 OK with decoupled profile details (`fullName`, `loyaltyTier`, `bookingCount`).
+- `POST /refresh` → 200 OK with rotated refresh tokens (Token Rotation security verified).
+- `POST /logout` → 200 OK, JTI token blacklisted in Redis cluster.
+- `GET /sessions` & `DELETE /sessions/:sessionId` → 200 OK, active session listed and terminated.
+- 5× wrong password → account locked for 30 minutes → 423 ACCOUNT_LOCKED with remaining numeric seconds inside body details.
+- `POST /forgot-password` → 200 OK, emails secure 6-digit password reset OTP (decoy returned on non-existent accounts).
+- `POST /reset-password` with valid OTP code → 200 OK, updates hash in credential vault.
 
 ---
 
@@ -2441,10 +2984,10 @@ vi.mock('../../src/repositories/user.repository', () => ({
 }));
 
 describe('authService.register', () => {
-  it('throws 409 when email already registered', async () => {
+  it('throws 409 AppError when email already registered', async () => {
     userRepository.findByEmail.mockResolvedValue({ id: '123' });
     await expect(authService.register({ name: 'A', email: 'exists@test.com', password: 'X' }))
-      .rejects.toMatchObject({ code: 'CONFLICT' });
+      .rejects.toMatchObject({ statusCode: 409, name: 'CONFLICT' });
   });
 });
 ```
@@ -2454,7 +2997,12 @@ describe('authService.register', () => {
 Use a separate `skyhub_user_test_db` database. Reset tables before each test suite:
 ```typescript
 beforeEach(async () => {
+  await prisma.rolePermission.deleteMany();
+  await prisma.userRole.deleteMany();
+  await prisma.permission.deleteMany();
+  await prisma.role.deleteMany();
   await prisma.refreshToken.deleteMany();
+  await prisma.userProfile.deleteMany();
   await prisma.outboxEvent.deleteMany();
   await prisma.user.deleteMany();
 });
@@ -2464,30 +3012,32 @@ beforeEach(async () => {
 
 | Area | Test Cases |
 |---|---|
-| Registration | Valid input, duplicate email, weak password, missing fields |
-| Email verification | Valid token, expired token, already verified |
-| Login | Correct credentials, wrong password, unverified account, locked account, non-existent email |
-| Account lockout | 5 failed attempts → locked, locked account returns correct `secondsRemaining` |
-| Token refresh | Valid rotation, expired refresh token, reuse after rotation |
-| Logout | Single session, all sessions, blacklist check |
-| Password reset | Valid flow, expired token, password same as old |
-| Profile update | Valid name, name too short, unauthenticated |
-| Loyalty tiers | SILVER→GOLD at 5 bookings, GOLD→PLATINUM at 15 |
+| **Registration** | Valid parameters, duplicate email conflicts, weak password validation. |
+| **Email Verification** | Valid 6-digit OTP code, expired code, invalid format (non-numeric / length). |
+| **Login Verification** | Correct credentials, wrong password lock counters, unverified accounts, locked accounts, step-up MFA login ticket redirection. |
+| **Account Lockout** | 5 failed attempts locks account for 30 minutes, locked account queries return dynamic `secondsRemaining`. |
+| **Active Session Management** | Retrieve list of active sessions, revoking custom `sessionId` terminates refresh, other devices remain unrevoked. |
+| **TOTP Authenticator MFA** | Setup key and QR code generation, verifying code enables MFA, logging in with MFA active forces step-up authentication. |
+| **Token Refresh** | Token rotation successfully rotates credentials, expired refresh tokens blocked, replay attack detection on rotated tokens. |
+| **Logout Flows** | Single session logout blacklists JTI in Redis, global logout kills all sessions in database. |
+| **Password Recovery** | Forgot password triggers 6-digit OTP recovery mail, reset password updates hash using OTP code, new password same as current password rule validation. |
+| **Profile Metadata** | Reading `/me` fetches credentials-free public profiles, PUT updates `fullName` correctly, unauthenticated requests blocked. |
+| **Loyalty upgrades** | Upgrades SILVER $\rightarrow$ GOLD at 5 bookings, and GOLD $\rightarrow$ PLATINUM at 15 bookings via Kafka listeners, writing outbox upgrade events. |
 
 ---
 
 ## Quick Reference: Build Checklist
 
 ```
-Step 1  ✓  Package.json, tsconfig.json, Prisma init, .env created
-Step 2  ✓  Migration run, tables created, seed data inserted
-Step 3  ✓  Config singletons (DB, Redis, Kafka, logger, keys), utilities, middlewares, email service, JWT types
+Step 1  ✓  Package.json, tsconfig.json, Prisma schema mapped, .env created
+Step 2  ✓  PostgreSQL migrate dev run, Dynamic RBAC, User & Profile tables seeded
+Step 3  ✓  Singletons (DB, Redis, Kafka, logger, keys), middlewares, compiled common-utils errors & envelopes
 Step 4  ✓  User, Token, Outbox repositories implemented and tested
-Step 5  ✓  AuthService, TokenService, LoyaltyService implemented and unit tested
-Step 6  ✓  Controllers, Routes, app.ts, server.ts — service boots and /health returns 200
-Step 7  ✓  OutboxWorker running, Kafka producer publishing, Booking consumer processing
-Step 8  ✓  JWKS endpoint returning public key
-Step 9  ✓  Integration tests pass for all 10 validation checklist items
+Step 5  ✓  AuthService, TokenService, LoyaltyService with dynamic JWT scopes and 6-digit OTPs
+Step 6  ✓  Controllers, Routes (all 21 endpoints mapped), app.ts, server.ts boots, /health ok
+Step 7  ✓  OutboxWorker running, Kafka event listener processing upgrades
+Step 8  ✓  JWKS endpoint returning public key in JWK format
+Step 9  ✓  Integration tests pass for all 12 validation checklist items
 ```
 
 Once all 9 steps pass their validation, Phase 1 (User Service) is complete and production-ready. Proceed to Phase 2: Flight Service.
