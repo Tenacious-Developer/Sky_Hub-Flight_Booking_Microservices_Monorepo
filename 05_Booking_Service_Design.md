@@ -18,6 +18,22 @@
 
 ---
 
+## ⚠️ Build Scope — Read Before Building Anything
+
+Built in **Phase 4** of [`00_Build_Roadmap.md`](00_Build_Roadmap.md) — but with one deliberate substitution: **the Payment Service does not exist yet.** Instead, you build a **fake payment consumer** (~30 lines in `scripts/fake-payment-consumer.ts`): it consumes `booking.initiated`, waits 2 seconds, then publishes `PAYMENT_SUCCESS` (80%) or `PAYMENT_FAILED` (20%) to `payment.result` using the exact message contract in §7.3.
+
+**Why a fake first?** It isolates the saga mechanics (the hard part) from Stripe integration (a different hard part). Because the fake honours the same message contract, Phase 5 swaps in the real Payment Service **without changing a single line of Booking Service code** — that is the whole point of contract-first messaging, and experiencing the swap is the lesson.
+
+| Stage | Features |
+|---|---|
+| **v1 — Phase 4** | Create booking (Feature 1, incl. price re-validation), payment success/failed consumers (Features 2–3), seat-timeout BullMQ worker (Feature 4), get/list bookings (Features 5–6), outbox worker with 3-destination routing (Feature 9), health check. |
+| **Phase 5** | Delete the fake consumer when the real Payment Service lands. |
+| **Phase 6** | `email-queue`/`reminder-queue` jobs produced here are finally *consumed* (Notification Service). Producing them in Phase 4 is harmless — they accumulate in `redis-core` until a worker exists. |
+| **Phase 7** | User-initiated cancellation + refund flow (Feature 7), circuit breaker + axios-retry hardening if deferred. |
+| **Phase 8** | `/metrics`, tracing. |
+
+---
+
 ## 1. Bounded Context & Responsibility
 
 The Booking Service is the **Saga Orchestrator** for the entire checkout transaction. It owns the booking lifecycle end-to-end — from the moment a user clicks "Book" to the moment the booking is CONFIRMED or CANCELLED. It drives every saga step, coordinates with Flight Service (seat hold) and Payment Service (via RabbitMQ), and handles all rollback paths.
@@ -132,9 +148,16 @@ We use a **Synchronous HTTP API Call** to the Flight Service to hold seats durin
     → If 404 → return 404 to client ("Flight not found")
     → If status ≠ ACTIVE → return 422 ("Flight is not available for booking")
 
-1b. Apply loyalty discount (from X-User-Loyalty-Tier header):
-    discountedPricePerSeat = Math.round(basePrice * multiplier)
+1b. Compute the charge with the SHARED pricing function (price-consistency rule):
+    import { calculateFinalPrice } from '@skyhub/common-utils'
+    discountedPricePerSeat = calculateFinalPrice(basePrice, X-User-Loyalty-Tier header)
     totalAmount = discountedPricePerSeat * seats
+
+    ← This is the SAME pure function the Search Service used to display the price.
+      Same authoritative inputs (basePrice from Flight Service, tier from verified JWT)
+      → the user is charged exactly what they were shown. NEVER accept a price from
+      the client request body — client-submitted prices are an attack vector.
+      (Phase 7 upgrade: validate a signed fare quote instead — see 01_Architecture.md §1.)
 
 1c. PATCH http://flight-service:3002/internal/flights/{flightId}/hold-seats
     Body: { seats, bookingId: pre-generated UUID }
@@ -205,6 +228,11 @@ BEGIN TRANSACTION
   UPDATE bookings SET status = 'CONFIRMED', confirmedAt = NOW()
   UPDATE saga_logs SET state = 'COMPLETED' WHERE bookingId = ? AND state = 'SEAT_HELD'
   INSERT INTO outbox_events (
+    eventType = 'CONFIRM_SEATS',
+    destination = HTTP,    ← drives PATCH /internal/flights/instances/:id/confirm-seats
+    payload = { flightId, bookingId }
+  )
+  INSERT INTO outbox_events (
     eventType = 'BOOKING_COMPLETED',
     destination = KAFKA,
     payload = { bookingId, userId, flightId, seats, totalAmount }
@@ -226,6 +254,21 @@ BullMQ.add('reminder-queue', {
 
 **How to calculate reminder delay:**
 The Booking Service needs to know the flight's departure datetime. This was stored at booking creation time (in `passengerDetails` or in a `flightDepartureAt` column). Design decision: store `flightDepartureAt` as a column on the `bookings` table at creation time — fetched from the Flight Service GET call in Feature 1. This avoids another HTTP call when processing the payment success event.
+
+**Why `CONFIRM_SEATS` must be sent (and what its 409 means):**
+Flight Service's `seat_holds` row is still `ACTIVE` after payment — only the confirm call makes the seat decrement permanent and shields it from Flight Service's hold-expiry sweeper (see `04_Flight_Service_Design.md` Features 9a/9b). Without it, the sweeper would release *paid* seats 15 minutes after hold time.
+
+**The nastiest saga edge case — payment landed after the hold expired:** if `confirm-seats` returns `409 HOLD_ALREADY_RELEASED` (user paid at 14:59, message arrived at 15:01, sweeper fired in between), the seats are already back in the pool and may even be sold. Handle it:
+```
+1. Re-attempt hold-seats for the same bookingId (fresh hold)
+   → 200: immediately confirm-seats again → saga completes normally
+   → 409 INSUFFICIENT_SEATS (sold out meanwhile):
+       UPDATE bookings SET status='CANCELLED'
+       INSERT outbox_events (eventType='REFUND_PAYMENT', destination=RABBITMQ, payload={bookingId, paymentId})
+       → Payment Service refunds via Stripe; user gets "booking failed, refund issued" email
+2. saga_logs records every step — this path is exactly why the SagaLog exists
+```
+This is a low-probability path, but designing it is the difference between a demo and a production system (and a favourite interview deep-dive).
 
 ---
 
@@ -278,12 +321,14 @@ COMMIT
 HTTP PATCH /internal/flights/:flightId/release-seats
   Body: { seats, bookingId }
   On failure: retry with axiosRetry (3 attempts, exponential delay)
-  On total failure: log critical error, manual ops intervention needed
+  On total failure: log error — Flight Service's hold-expiry sweeper is the backstop
 
 BullMQ.add('email-queue', {
   data: { bookingId, emailType: 'BOOKING_EXPIRED' }
 })
 ```
+
+**This job is the fast path, not the only path.** If this worker never fires (Booking Service down, `redis-core` down, job lost), Flight Service's own hold-expiry sweeper releases the hold within ~60s of `held_until` passing (see `04_Flight_Service_Design.md` Feature 9b). The two paths are race-safe against each other via the hold's `status` column — whichever acts first wins; the other becomes a no-op. The division of labour: **this job** owns flipping the *booking* to `TIMED_OUT` (Booking Service's data); **the sweeper** guarantees the *inventory* can never leak (Flight Service's data). Each service reconciles its own source of truth.
 
 ---
 
@@ -463,7 +508,9 @@ If you update a single `state` column in `bookings`, you lose the history. With 
 
 ### 3.3 Complete Prisma Schema
 
-**File: `services/booking-service/prisma/schema.prisma`**
+**File: `services/booking-service/src/db/schema.prisma`**
+
+> **Prisma 7 convention (established in flight-service — follow it here):** schema at `src/db/schema.prisma`, migrations at `src/db/migrations/`, generated client at `src/db/generated/prisma/` (gitignored). The datasource `url` is NOT in the schema — it lives in `src/config/prisma.config.ts` (`defineConfig`), and CLI commands run via `db:*` npm scripts with `--config src/config/prisma.config.ts`. Runtime client uses `@prisma/adapter-pg` + `pg.Pool` (`new PrismaClient({ adapter })`). Any `prisma/…` paths, `database.ts` references, or `@prisma/client ^5.x` versions later in this doc predate this convention — use the flight-service layout and Prisma `^7.8.0` when building.
 
 ```prisma
 generator client {

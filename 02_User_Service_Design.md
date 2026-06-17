@@ -16,6 +16,23 @@
 
 ---
 
+## ⚠️ Build Scope — Read Before Building Anything
+
+This document describes the *finished* User Service — a full IAM system in the league of Auth0/Keycloak. **Do not build all of it at once.** It is staged into three versions; build **v1 only** in Phase 2 of [`00_Build_Roadmap.md`](00_Build_Roadmap.md), then return for v2/v3 in Phase 7. Retrofitting v2/v3 onto a live service is deliberate — changing a running system safely is the skill being practiced.
+
+| Stage | Features | Why this stage |
+|---|---|---|
+| **v1 — Core Auth** (Phase 2) | Register, Login, Refresh + rotation, Logout (+ jti blacklist), `GET/PUT /me`, Change password, JWKS endpoint, Outbox events, Health check. **Static role**: single `role` column/enum on the user — no RBAC tables. | The minimum for the rest of the platform to have real authenticated users. Everything else depends on this and nothing here depends on v2/v3. |
+| **v2 — Account Security** (Phase 7) | Account lockout (5 attempts / 30 min), email verification via 6-digit OTP, resend-verification, forgot/reset password, timing-safe dummy compare. | Each feature is an independent, additive retrofit: new columns + new endpoints, no breaking changes to v1 flows. |
+| **v3 — Enterprise IAM** (Phase 7, optional) | TOTP MFA + backup codes, dynamic RBAC (`roles`/`permissions`/join tables + `permissions[]` JWT claim), device-aware session management, audit logging, loyalty-tier Kafka consumer. | The most complex and least load-bearing features. Building these *first* is how auth services eat entire projects. |
+| **Out of scope until Phase 8** | Metrics endpoint, OpenTelemetry tracing. | Cross-cutting hardening, done once for all services. |
+
+**Schema note:** the full Prisma schema in §3 *includes* v2/v3 columns and tables. Including dormant columns from day one is cheap; you may also create the v3 RBAC tables in the v1 migration but leave them empty and unused — or defer them and practice a real additive migration later. Either is fine; **do not build the v3 endpoints/logic in v1.**
+
+**v1 JWT note:** until v3's dynamic RBAC exists, the JWT carries `role` (from the user's enum column) and **no `permissions` array**. Downstream services check `X-User-Role`. When v3 lands, `permissions` is added as a *new* claim — additive, non-breaking.
+
+---
+
 ## 1. Bounded Context & Responsibility
 
 The User Service is the **authoritative identity provider** for the entire SkyHub cluster. Every other service is a consumer of identity — not a producer.
@@ -74,43 +91,46 @@ No other service calls `SELECT * FROM users` — ever.
 2. Zod validates: name (min 2 chars), email (valid format), password (min 8 chars, complexity rules)
 3. Check if email already exists → 409 Conflict if yes
 4. Hash password with `bcrypt(password, 12)` — ~200ms intentionally
-5. Generate email verification token: `crypto.randomBytes(32).toString('hex')` (64 hex chars)
-6. Store `SHA-256(token)` hash in DB — never the raw token
+5. Generate a 6-digit OTP: `crypto.randomInt(100000, 999999).toString()` (see §2.1 — OTPs replaced the older link-token design)
+6. Store `SHA-256(code)` in `email_verify_token` with `email_verify_expires_at = NOW() + 10 minutes` — never the raw code
 7. In ONE atomic DB transaction:
-   - `INSERT INTO users (...)` with `email_verified = false`, `is_active = true`
+   - `INSERT INTO users (...)` with `email_verified = false`, `is_active = true` + the `user_profiles` row
    - `INSERT INTO outbox_events (type='USER_REGISTERED', ...)`
-8. Send verification email with link: `https://skyhub.com/verify-email?token=<raw_token>`
+8. Email the raw 6-digit code (valid 10 minutes)
 9. Return `201 Created` — user must verify email before they can log in
 
 **Why email verification?**
 Without it, anyone can register with someone else's email address. That person then gets spam or account recovery emails they didn't request. It also prevents throwaway registrations for abusing the system.
 
-**Why store a hash of the verification token (not the raw token)?**
-The DB could be leaked via SQL injection or a backup exposure. If the raw token is stored, an attacker reads it and verifies any email. SHA-256 of the token is useless without the original.
+**Why store a hash of the code (not the raw code)? And why hashing alone is NOT enough for OTPs:**
+The DB could be leaked via SQL injection or a backup exposure, so the raw code is never stored. But unlike a 256-bit link token, a 6-digit OTP has only 900,000 possibilities — SHA-256 of it is brute-forced offline in milliseconds. The hash is therefore only one layer; the real protections are the **10-minute expiry** and a **verification attempt cap** (max 5 wrong codes → invalidate the code, force a resend). Without the attempt cap, `/verify-email` can be brute-forced online.
 
 ---
 
 ### Feature 2: Login with Account Lockout Protection
 
-**Flow:**
+**Flow (order matters — see the anti-enumeration note below):**
 1. Zod validates `{ email, password }`
 2. Find user by email (B-Tree indexed — sub-millisecond)
-3. Check `is_active = true` → 401 if false (banned account)
-4. Check `email_verified = true` → 403 if false (ask them to verify first)
-5. Check `locked_until` — if set and `locked_until > NOW()` → 423 Locked, return how many seconds remain
-6. Run `bcrypt.compare(password, passwordHash)` — takes ~200ms
-7. If password wrong:
+3. Check `locked_until` — if set and `locked_until > NOW()` → 423 Locked, return how many seconds remain (lockout must fire *before* the compare to do its job; a 423 revealing the account exists is the accepted trade-off)
+4. Run `bcrypt.compare(password, user?.passwordHash ?? DUMMY_HASH)` — ~200ms for existing AND non-existent users alike (§4.5)
+5. If password wrong (or user does not exist): return the same generic 401 `UNAUTHORIZED`; for existing users also:
    - Increment `failed_login_attempts`
    - If `failed_login_attempts >= 5`: set `locked_until = NOW() + 30 minutes`, return 423
-   - Else return 401
-8. If password correct:
+6. Password correct — **only now** check account state:
+   - `is_active = false` → 401 (banned)
+   - `email_verified = false` → 401 `EMAIL_NOT_VERIFIED` (matches Endpoint 4)
+7. Proceed with success:
    - Reset `failed_login_attempts = 0`
    - Update `last_login_at = NOW()`
    - Sign RS256 Access Token (15 min): `{ sub: userId, role, loyaltyTier, jti: uuid() }`
    - Generate raw refresh token: `crypto.randomBytes(64).toString('hex')`
    - Store `SHA-256(refreshToken)` in `refresh_tokens` table with 7-day expiry, device info, IP
-   - Write `USER_LOGGED_IN` to `outbox_events` (triggers Search Service to cache user's loyalty tier)
+   - Write `USER_LOGGED_IN` to `outbox_events` (audit/analytics only — the Search Service deliberately ignores this event; it gets the tier from `USER_REGISTERED` / `USER_LOYALTY_UPDATED`, see doc 03 §7.3)
    - Return `{ accessToken, refreshToken, user: { ... } }`
+
+**Why are `is_active` / `email_verified` checked AFTER the password compare?**
+If they were checked first (as an earlier draft did), an unverified or banned account would return a distinct error instantly — without the ~200ms compare — letting an attacker *without the password* distinguish "registered but unverified" from "not registered" by both response content and timing. Post-compare, only someone who already knows the correct password learns the account state, which is acceptable.
 
 **Why 5 attempts then 30-minute lockout?**
 This is the OWASP recommendation. It makes automated credential-stuffing attacks economically infeasible — an attacker can only try 5 passwords per IP per 30 minutes per account. Combined with the API Gateway's rate limit (20 auth requests / 15 min per IP), the attack surface is extremely narrow.
@@ -126,7 +146,7 @@ This is the OWASP recommendation. It makes automated credential-stuffing attacks
 4. Found → check `expires_at > NOW()` → 401 if expired
 5. Fetch the user → check `is_active = true`
 6. **Rotation:** In ONE transaction:
-   - `DELETE FROM refresh_tokens WHERE id = <found_id>`
+   - `DELETE FROM refresh_tokens WHERE id = <found_id>` — the delete is the **atomic guard against concurrent use**: if two requests race with the same token, only one delete succeeds; the loser gets 401 (see token.service §Step 5)
    - Generate new raw refresh token
    - `INSERT INTO refresh_tokens` with new hash + 7-day expiry
 7. Sign a new Access Token with fresh 15-min expiry
@@ -145,6 +165,7 @@ If a refresh token is stolen, the attacker can use it repeatedly for 7 days with
    - The client sends the refresh token in the body OR the service deletes by userId + device fingerprint
 3. Write `jti` to Redis blacklist: `SET blacklist:jti:{jti} 1 EX {remaining_seconds}`
    - `remaining_seconds = token.exp - Math.floor(Date.now() / 1000)`
+   - `jti` and `exp` come from the Gateway-injected `X-User-Jti` / `X-User-Exp` headers (part of the Gateway header contract — the service never re-parses the JWT)
 4. Return `200 OK`
 
 **All-sessions logout (`POST /api/v1/auth/logout-all`):**
@@ -161,20 +182,20 @@ After the token naturally expires, the API Gateway rejects it anyway (exp check)
 ### Feature 5: Email Verification
 
 **Verify email (`POST /api/v1/auth/verify-email`):**
-1. Client sends `{ token }` from the email link
-2. Compute `SHA-256(token)`
-3. Find user with matching `email_verification_token` AND `email_verification_expires_at > NOW()`
-4. Not found or expired → 400 Bad Request
-5. Update: `email_verified = true`, clear `email_verification_token`, clear `email_verification_expires_at`
+1. Client sends `{ email, code }` (the 6-digit OTP — see Endpoint 2)
+2. Find user by email; compute `SHA-256(code)`
+3. Check it matches `email_verify_token` AND `email_verify_expires_at > NOW()`
+4. No match or expired → 400 `INVALID_VERIFY_CODE`; increment the attempt counter — after 5 wrong attempts invalidate the code (clear token fields) and require a resend
+5. Match → update `email_verified = true`, clear `email_verify_token` + `email_verify_expires_at`
 6. Write `USER_EMAIL_VERIFIED` to outbox
 7. Return `200 OK`
 
 **Resend verification (`POST /api/v1/auth/resend-verification`):**
 1. Client sends `{ email }`
-2. Find user by email
-3. If already verified → 400 "Already verified"
-4. Rate limit: check `email_verification_expires_at` — if it was set less than 2 minutes ago, reject (prevent email bombing)
-5. Generate new token, hash it, update DB, send new email
+2. Find user by email — if not found, return the same decoy 200 (no enumeration)
+3. If already verified → same decoy 200
+4. Rate limit: if the previous code was issued less than 2 minutes ago, reject with 429 (prevent email bombing)
+5. Generate a new 6-digit OTP, hash it, update DB (reset attempt counter), send new email
 6. Return `200 OK`
 
 ---
@@ -185,16 +206,16 @@ After the token naturally expires, the API Gateway rejects it anyway (exp check)
 1. Client sends `{ email }`
 2. **Always return `200 OK` regardless of whether email exists** — this prevents email enumeration attacks (attacker cannot discover which emails are registered)
 3. If email found in DB:
-   - Generate reset token: `crypto.randomBytes(32).toString('hex')`
-   - Store `SHA-256(token)` in `password_reset_token`, set `password_reset_expires_at = NOW() + 1 hour`
-   - Send reset email with link: `https://skyhub.com/reset-password?token=<raw_token>`
-4. Return `200 OK { message: "If that email exists, a reset link was sent" }`
+   - Generate a 6-digit recovery OTP: `crypto.randomInt(100000, 999999).toString()`
+   - Store `SHA-256(code)` in `reset_token`, set `reset_expires_at = NOW() + 10 minutes`
+   - Email the raw code (same 2-minute resend rate limit as verification)
+4. Return `200 OK { message: "If that email exists, a reset code was sent" }`
 
 **Reset password (`POST /api/v1/auth/reset-password`):**
-1. Client sends `{ token, newPassword }`
+1. Client sends `{ email, code, newPassword }` (see Endpoint 12)
 2. Validate new password meets complexity rules
-3. Compute `SHA-256(token)` → find user with matching `password_reset_token` AND `password_reset_expires_at > NOW()`
-4. Not found or expired → 400 "Reset link is invalid or has expired"
+3. Find user by email; compute `SHA-256(code)` → check it matches `reset_token` AND `reset_expires_at > NOW()`
+4. No match or expired → 400 `INVALID_RESET_TOKEN`; same 5-attempt cap as email verification (then invalidate the code)
 5. Hash new password with bcrypt
 6. In ONE transaction:
    - Update `password_hash`, clear reset token fields
@@ -249,7 +270,7 @@ If an attacker changed the password, the legitimate user would immediately get l
 | PLATINUM | 15+ completed bookings | 15% |
 
 **How `booking_count` is incremented:**
-The Booking Service publishes a `BOOKING_COMPLETED` Kafka event when a booking is confirmed. The User Service has a Kafka consumer listening to `booking-events` topic. When received, it increments `users.booking_count` for that `userId` and recalculates the tier.
+The Booking Service publishes a `BOOKING_COMPLETED` Kafka event when a booking is confirmed. The User Service has a Kafka consumer listening to `booking-events` topic. When received, it increments `user_profiles.booking_count` for that `userId` and recalculates the tier. **The consumer is idempotent** — each event's `eventId` is recorded in the `processed_events` table in the same transaction as the atomic increment, so an at-least-once redelivery never double-counts (see Step 7 for the implementation).
 
 **Tier upgrade logic (in `loyalty.service.ts`):**
 ```
@@ -296,10 +317,13 @@ Events published by the User Service:
 **All events use the Outbox Pattern:**
 - Event written to `outbox_events` table in the same DB transaction as the business write
 - Background `OutboxWorker` polls `outbox_events` every 5 seconds
-- Publishes to Kafka topic `user-identity-events`
+- Publishes to Kafka topic `user-identity-events` (key = `userId` → per-user ordering)
 - Marks event as `PUBLISHED`
+- **Worker behaviour is identical to Flight Service's** (doc 04, Feature 13): recursive `setTimeout` (a slow tick never overlaps the next), stale-`PROCESSING` reclaim on every tick, and `retry_count` — an event goes `FAILED` only after the retry cap, **never on the first transient failure** (a 30-second Kafka blip must not strand events).
 
-This guarantees **exactly-once semantics**: if the service crashes after writing to the DB but before publishing to Kafka, the OutboxWorker will pick up and publish the pending event on restart.
+This guarantees the event is **never lost** (at-least-once delivery): if the service crashes after writing to the DB but before publishing to Kafka, the OutboxWorker will pick up and publish the pending event on restart.
+
+> ⚠️ **Precision matters here (common interview trap):** the outbox pattern is **at-least-once**, *not* exactly-once. The worker can crash *after* publishing but *before* marking the row PUBLISHED — the event is then published again on restart. True exactly-once delivery is impossible across a network; the system achieves **effectively-once processing** by combining at-least-once delivery with **idempotent consumers** (e.g., the Search Service upserts by `userId`, so consuming `USER_REGISTERED` twice produces identical state). See `01_Architecture.md` §12.6.
 
 ---
 
@@ -330,7 +354,7 @@ The API Gateway fetches this once on startup, caches the key in memory, and refr
 
 ### Feature 13: Health Check
 
-**`GET /health` — public, no auth:**
+**`GET /api/v1/health` — public, no auth (versioned path — cluster convention, same as Flight/Search):**
 
 ```json
 {
@@ -424,6 +448,7 @@ To align with modern industry-standard designs for **Identity & Access Managemen
                               │ id (UUID) [PK]         │
                               │ email (VARCHAR) [UQ]   │
                               │ password_hash (VARCHAR)│
+                              │ role (ENUM) ← v1 static│
                               │ is_active (BOOLEAN)    │
                               │ failed_attempts (INT)  │
                               │ locked_until (TIMESTAMPTZ)
@@ -433,7 +458,7 @@ To align with modern industry-standard designs for **Identity & Access Managemen
                                           │ 1
                                           │
                   ┌───────────────────────┼───────────────────────┐
-                  │ 1                     │ 1                     │ 1
+                  │ 1                     │ N                     │ N
                   ▼                       ▼                       ▼
       ┌───────────────────────┐  ┌───────────────────────┐  ┌───────────────────────┐
       │     USER_PROFILES     │  │    REFRESH_TOKENS     │  │      AUDIT_LOGS       │
@@ -478,6 +503,8 @@ This table acts as the vault. It only handles identity verification, multi-facto
 | `email` | VARCHAR(255) | B-Tree indexed and unique. Used as the unique login handle. |
 | `password_hash` | VARCHAR(255) | Holds the highly secure Bcrypt hash (rounds=12). Never loaded during profile requests. |
 | `is_active` | BOOLEAN | Allows administrative soft deactivation (e.g. banning) without wiping audit histories. |
+| `role` | ENUM (`AccountRole`) | **v1 static role** (`CUSTOMER \| FLIGHT_ADMIN \| SUPER_ADMIN`, default CUSTOMER) — the JWT `role` claim is signed from this column. v3's dynamic RBAC tables add the `permissions` claim later; this stays as the coarse role. |
+| `email_verify_attempts` / `reset_attempts` | INT | Enforce the 5-wrong-codes cap — a 6-digit OTP space (900k) is online-brute-forceable without it. Reset to 0 when a new code is issued. |
 | `failed_login_attempts` | INT | Lockout tracker. Incremented on wrong passwords, reset on success. |
 | `locked_until` | TIMESTAMPTZ | Absolute lock expiration time. The auth pipeline verifies `locked_until > NOW()`. |
 | `mfa_enabled` | BOOLEAN | Indicates if the user has completed authenticator TOTP setup. |
@@ -524,7 +551,9 @@ Allows administrators to audit security operations natively without performing e
 
 ### 3.3 Complete Production-Grade Prisma Schema
 
-**File: `services/user-service/prisma/schema.prisma`**
+**File: `services/user-service/src/db/schema.prisma`**
+
+> **Prisma 7 convention (established in flight-service — follow it here):** schema at `src/db/schema.prisma`, migrations at `src/db/migrations/`, generated client at `src/db/generated/prisma/` (gitignored). The datasource `url` is NOT in the schema — it lives in `src/config/prisma.config.ts` (`defineConfig`), and CLI commands run via `db:*` npm scripts with `--config src/config/prisma.config.ts`. Runtime client uses `@prisma/adapter-pg` + `pg.Pool` (`new PrismaClient({ adapter })`). Any `prisma/…` paths, `database.ts` references, or `@prisma/client ^5.x` versions later in this doc predate this convention — use the flight-service layout and Prisma `^7.8.0` when building.
 
 ```prisma
 datasource db {
@@ -542,7 +571,12 @@ model User {
   email                String        @unique
   passwordHash         String        @map("password_hash")
   isActive             Boolean       @default(true) @map("is_active")
-  
+
+  // v1 static role — the JWT `role` claim is signed from THIS column (see Build Scope).
+  // v3's dynamic RBAC tables below add the `permissions` claim later; this column
+  // remains the coarse role even after v3.
+  role                 AccountRole   @default(CUSTOMER)
+
   // Security / Lockout properties
   failedLoginAttempts  Int           @default(0) @map("failed_login_attempts")
   lockedUntil          DateTime?     @map("locked_until")
@@ -557,8 +591,10 @@ model User {
   emailVerified        Boolean       @default(false) @map("email_verified")
   emailVerifyToken     String?       @map("email_verify_token") // SHA-256 hash of OTP
   emailVerifyExpiresAt DateTime?     @map("email_verify_expires_at")
+  emailVerifyAttempts  Int           @default(0) @map("email_verify_attempts") // 5 wrong codes → invalidate code (Feature 5)
   resetToken           String?       @map("reset_token") // SHA-256 hash of OTP
   resetExpiresAt       DateTime?     @map("reset_expires_at")
+  resetAttempts        Int           @default(0) @map("reset_attempts")        // same 5-attempt cap (Feature 6)
 
   // Audit and lifecycle
   createdAt            DateTime      @default(now()) @map("created_at")
@@ -571,10 +607,16 @@ model User {
   userRoles            UserRole[]
   auditLogs            AuditLog[]
 
-  @@index([email])
+  // NOTE: no @@index([email]) — @unique above already creates that index
   @@index([emailVerifyToken])
   @@index([resetToken])
   @@map("users")
+}
+
+enum AccountRole {
+  CUSTOMER
+  FLIGHT_ADMIN
+  SUPER_ADMIN
 }
 
 // ─── 2. USER PROFILE (Optimized 1-to-1 relationship using user_id as PK) ─────
@@ -651,6 +693,7 @@ model RefreshToken {
   id         String   @id @default(uuid()) // Session ID
   userId     String   @map("user_id")
   tokenHash  String   @unique @map("token_hash") // SHA-256 hash of rotated token
+  lastJti    String?  @map("last_jti") // jti of the latest access token issued via this session — powers `isCurrent` in GET /sessions
   deviceInfo String?  @map("device_info")
   ipAddress  String?  @map("ip_address")
   expiresAt  DateTime @map("expires_at")
@@ -662,16 +705,37 @@ model RefreshToken {
   @@map("refresh_tokens")
 }
 
+enum OutboxStatus {
+  PENDING
+  PROCESSING
+  PUBLISHED
+  FAILED
+}
+
+// Same shape + worker behaviour as Flight Service (doc 04 §3.4 / Feature 13):
+// PROCESSING + updated_at power the stale-PROCESSING reclaim, retry_count caps retries.
 model OutboxEvent {
-  id          String   @id @default(uuid())
-  eventType   String   @map("event_type")
+  id          String       @id @default(uuid())
+  eventType   String       @map("event_type")
   payload     Json
-  status      String   @default("PENDING") // PENDING, PUBLISHED, FAILED
-  createdAt   DateTime @default(now()) @map("created_at")
-  publishedAt DateTime? @map("published_at")
+  status      OutboxStatus @default(PENDING)
+  retryCount  Int          @default(0) @map("retry_count")
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+  publishedAt DateTime?    @map("published_at")
 
   @@index([status, createdAt])
   @@map("outbox_events")
+}
+
+// Consumer-side dedupe: Kafka delivery is at-least-once — every consumed event's ID
+// is recorded in the SAME transaction as its side effect, so replays are no-ops.
+// (Used by the BOOKING_COMPLETED consumer — see Feature 9 / Step 7.)
+model ProcessedEvent {
+  eventId     String   @id @map("event_id")
+  processedAt DateTime @default(now()) @map("processed_at")
+
+  @@map("processed_events")
 }
 
 // ─── 5. SECURITY AUDIT LOGS ─────────────────────────────────────────────────
@@ -698,8 +762,8 @@ model AuditLog {
 | Table | Index | Type | Purpose |
 | :--- | :--- | :--- | :--- |
 | `users` | `email` | B-Tree UNIQUE | Exact match credential lookups during authentication. |
-| `users` | `email_verify_token` | B-Tree UNIQUE | One-way hash verification lookup. |
-| `users` | `reset_token` | B-Tree UNIQUE | Password recovery token validation. |
+| `users` | `email_verify_token` | B-Tree (non-unique) | One-way hash verification lookup. Deliberately NOT unique — 6-digit OTPs are low-entropy, two users can hold the same code (see §3.2). |
+| `users` | `reset_token` | B-Tree (non-unique) | Password recovery code validation. Same non-unique rationale. |
 | `user_profiles` | `user_id` | B-Tree UNIQUE | Dynamic 1-to-1 fetching for metadata. |
 | `roles` | `name` | B-Tree UNIQUE | Role checking constraint. |
 | `permissions` | `name` | B-Tree UNIQUE | Permission checking constraint. |
@@ -736,7 +800,9 @@ bcrypt automatically generates a unique random salt per hash. Two identical pass
 
 **Key pair generation (run once, store in environment):**
 ```bash
-openssl genrsa -out private.pem 2048
+# genpkey outputs PKCS#8 ("-----BEGIN PRIVATE KEY-----") — REQUIRED by jose's importPKCS8().
+# Do NOT use `openssl genrsa` — it outputs PKCS#1 ("BEGIN RSA PRIVATE KEY"), which importPKCS8() rejects at startup.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out private.pem
 openssl rsa -in private.pem -pubout -out public.pem
 ```
 
@@ -798,11 +864,15 @@ Counter:     Reset to 0 on any successful login
 
 **Timing-safe comparison:** Always run `bcrypt.compare` even for non-existent users (with a dummy hash) to prevent timing attacks that reveal whether an email is registered:
 ```typescript
-// If user not found, compare against a dummy hash anyway
-// This takes ~200ms regardless, preventing timing-based email enumeration
-const dummyHash = '$2b$12$invalidhashthatisjustfillerdata';
-await bcrypt.compare(password, user?.passwordHash ?? dummyHash);
-// Then check if user actually existed
+// The dummy MUST be a structurally valid bcrypt hash at the same cost factor.
+// bcrypt.compare against a malformed string returns almost instantly,
+// which re-opens the timing side-channel the dummy exists to close.
+// Compute it ONCE at startup:
+const DUMMY_HASH = await bcrypt.hash('timing-equalizer-not-a-real-password', 12);
+
+// In the login path:
+await bcrypt.compare(password, user?.passwordHash ?? DUMMY_HASH);
+// Then check if user actually existed → uniform ~200ms either way
 ```
 
 ---
@@ -967,9 +1037,9 @@ Every response, success or error, uses this uniform JSON shape:
     ```
 *   **Behavior**: 
     1. Looks up user. If locked (`locked_until > NOW()`), returns `423 Locked`.
-    2. Runs timing-safe Bcrypt password comparison. 
-    3. If failed, increments lockout counters (locks at 5).
-    4. If successful, checks if user has `mfa_enabled = true`. 
+    2. Runs timing-safe Bcrypt password comparison (dummy hash for non-existent users — §4.5).
+    3. If failed, increments lockout counters (locks at 5) and returns the generic 401.
+    4. If successful, checks `is_active` / `email_verified` (post-compare — anti-enumeration, see Feature 2), then checks if user has `mfa_enabled = true`. 
        - If **MFA Active**: Returns a short-lived temporary ticket token and sets `mfaRequired = true`.
        - If **No MFA**: Signs the RS256 Access Token (attaching dynamic scopes/permissions in claims) and writes a new SHA-256 refresh token hash to the DB.
 *   **Success Response (MFA Inactive) — 200 OK**:
@@ -988,7 +1058,7 @@ Every response, success or error, uses this uniform JSON shape:
         "tokens": {
           "accessToken": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
           "refreshToken": "a3f2b1c4...128-hex-chars...",
-          "expiresAt": 900
+          "expiresIn": 900
         }
       },
       "traceId": "tr-kl89x12a-381a"
@@ -1259,7 +1329,7 @@ Every response, success or error, uses this uniform JSON shape:
 ### 5.2 Device-Aware Session Management Endpoints (Auth Required)
 
 #### Endpoint 13: GET /api/v1/auth/sessions
-*   **Behavior**: Reads all active `RefreshToken` entries for this user. Uses `User-Agent` headers parsed cleanly into device/browser metadata.
+*   **Behavior**: Reads all active `RefreshToken` entries for this user. Uses `User-Agent` headers parsed cleanly into device/browser metadata. `isCurrent` is computed as `row.lastJti === req.userJti` — every login/refresh stores the issued access token's `jti` on its refresh-token row (`last_jti` column), which is the only link between the presented access token and a session row.
 *   **Success Response — 200 OK**:
     ```json
     {
@@ -1489,7 +1559,8 @@ These routes are protected by the dynamic RBAC middleware. The Gateway checks th
     {
       "success": false,
       "error": {
-        "code": "NOT_FOUND",
+        "statusCode": 404,
+        "name": "NOT_FOUND",
         "message": "The target user ID requested for role updates does not exist."
       },
       "traceId": "tr-adr82xa-81ba"
@@ -1519,7 +1590,7 @@ These routes are protected by the dynamic RBAC middleware. The Gateway checks th
     }
     ```
 
-#### Endpoint 21: GET /health
+#### Endpoint 21: GET /api/v1/health
 *   **Auth required**: No
 *   **Success Response (Healthy) — 200 OK**:
     ```json
@@ -1676,7 +1747,7 @@ services/user-service/
 │   │
 │   ├── routes/
 │   │   ├── auth.routes.ts         ← Maps HTTP verbs + paths → controller methods
-│   │   ├── health.routes.ts       ← GET /health — DB + Redis + Kafka liveness checks
+│   │   ├── health.routes.ts       ← GET /api/v1/health — DB + Redis + Kafka liveness checks
 │   │   ├── jwks.routes.ts         ← GET /.well-known/jwks.json — public key distribution
 │   │   ├── metrics.routes.ts      ← GET /metrics — Prometheus scrape endpoint
 │   │   └── schemas/
@@ -1684,8 +1755,9 @@ services/user-service/
 │   │
 │   ├── middlewares/
 │   │   ├── validate.ts            ← Generic Zod validation middleware factory
-│   │   ├── requireAuth.ts         ← Reads X-User-Id + X-User-Role headers (injected by Gateway)
-│   │   └── errorHandler.ts        ← Global Express error handler — formats all errors
+│   │   ├── requireAuth.ts         ← Reads X-User-Id/Role/Jti/Exp headers (injected by Gateway)
+│   │   ├── requireRole.ts         ← Local role enforcement on /admin routes (defense in depth)
+│   │   └── errorHandler.ts        ← Re-exports globalErrorHandler + notFoundHandler from common-utils
 │   │
 │   ├── events/
 │   │   ├── producers/
@@ -1846,7 +1918,8 @@ KAFKA_CONSUMER_GROUP_ID=user-service-booking-consumer
 
 # ── JWT / RS256 Keys ──────────────────────────────────────────────────
 # Paste the FULL PEM content (multiline) with escaped newlines or use a file path
-JWT_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----"
+# Must be PKCS#8 ("BEGIN PRIVATE KEY", from `openssl genpkey`) — jose's importPKCS8() rejects PKCS#1 ("BEGIN RSA PRIVATE KEY")
+JWT_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----"
 JWT_PUBLIC_KEY="-----BEGIN PUBLIC KEY-----\nMIIB...\n-----END PUBLIC KEY-----"
 JWT_KEY_ID=skyhub-key-v1
 JWT_ACCESS_TOKEN_EXPIRY=15m
@@ -1965,7 +2038,8 @@ Work through these steps in order. Complete and validate each step before moving
 6. Create all other config files from Step 3: `database.ts`, `redis.ts`, `kafka.ts`, `logger.ts`, `keys.ts`
 7. Generate RSA key pair (run once, store the output in `.env`):
    ```bash
-   openssl genrsa -out private.pem 2048
+   # PKCS#8 format — required by jose's importPKCS8() in keys.ts
+   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out private.pem
    openssl rsa -in private.pem -pubout -out public.pem
    # Then paste the contents into .env as JWT_PRIVATE_KEY and JWT_PUBLIC_KEY
    # Replace actual newlines with \n so they fit on one line in .env
@@ -2086,12 +2160,14 @@ async function seed() {
       name:  process.env.SUPER_ADMIN_NAME  ?? 'Super Admin',
       email: process.env.SUPER_ADMIN_EMAIL ?? 'superadmin@skyhub.com',
       pass:  process.env.SUPER_ADMIN_PASSWORD ?? 'SuperAdmin1!@#',
-      roleId: superAdminRole.id,
+      role:  'SUPER_ADMIN' as const,   // v1 static column — what the JWT is signed from
+      roleId: superAdminRole.id,        // v3 dynamic RBAC link
     },
     {
       name:  process.env.FLIGHT_ADMIN_NAME  ?? 'Flight Admin',
       email: process.env.FLIGHT_ADMIN_EMAIL ?? 'flightadmin@skyhub.com',
       pass:  process.env.FLIGHT_ADMIN_PASSWORD ?? 'FlightAdmin1!@#',
+      role:  'FLIGHT_ADMIN' as const,
       roleId: flightAdminRole.id,
     },
   ];
@@ -2111,6 +2187,7 @@ async function seed() {
         data: {
           email: admin.email,
           passwordHash,
+          role: admin.role,        // v1 static role
           isActive: true,
           emailVerified: true
         }
@@ -2197,6 +2274,12 @@ export const kafkaProducer = kafka.producer({
   allowAutoTopicCreation: false,
   transactionTimeout:     30000,
 });
+
+// Real connectivity flag for /health — kafkajs has no isConnected() method
+let kafkaUp = false;
+kafkaProducer.on('producer.connect',    () => { kafkaUp = true;  });
+kafkaProducer.on('producer.disconnect', () => { kafkaUp = false; });
+export const isKafkaConnected = () => kafkaUp;
 ```
 
 **`src/config/logger.ts`:**
@@ -2325,7 +2408,7 @@ interface SuccessOptions {
 interface ErrorOptions {
   res:        Response;
   statusCode: number;
-  code:       string;
+  name:       string;     // machine-readable error code — matches the §5 envelope + common-utils handler
   message:    string;
   details?:   Array<{ field: string; message: string }>;
   traceId:    string;
@@ -2335,8 +2418,8 @@ export function sendSuccess({ res, statusCode, message, data = null, traceId }: 
   res.status(statusCode).json({ success: true, message, data, traceId });
 }
 
-export function sendError({ res, statusCode, code, message, details, traceId }: ErrorOptions) {
-  res.status(statusCode).json({ success: false, error: { code, message, details }, traceId });
+export function sendError({ res, statusCode, name, message, details, traceId }: ErrorOptions) {
+  res.status(statusCode).json({ success: false, error: { statusCode, name, message, details }, traceId });
 }
 ```
 
@@ -2355,7 +2438,7 @@ export function validate(schema: ZodSchema) {
         message: e.message,
       }));
       return sendError({
-        res, statusCode: 400, code: 'VALIDATION_ERROR',
+        res, statusCode: 400, name: 'VALIDATION_ERROR',
         message: 'Request validation failed', details,
         traceId: req.headers['x-correlation-id'] as string ?? '',
       });
@@ -2377,10 +2460,14 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
   const userId   = req.headers['x-user-id']   as string;
   const userRole = req.headers['x-user-role'] as string;
   const userJti  = req.headers['x-user-jti']  as string;  // needed for JWT blacklisting on logout
+  const userExp  = req.headers['x-user-exp']  as string;  // token exp (unix secs) — blacklist TTL = exp − now
+  // NOTE: X-User-Jti and X-User-Exp are part of the Gateway header contract
+  // (01_Architecture.md §4.2 / 00_Build_Roadmap.md Phase 2) — without them,
+  // logout cannot blacklist the access token.
 
   if (!userId || !userRole) {
     return sendError({
-      res, statusCode: 401, code: 'UNAUTHORIZED',
+      res, statusCode: 401, name: 'UNAUTHORIZED',
       message: 'Authentication required',
       traceId: req.headers['x-correlation-id'] as string ?? '',
     });
@@ -2389,6 +2476,7 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
   req.userId   = userId;
   req.userRole = userRole;
   req.userJti  = userJti;
+  req.userExp  = userExp ? Number(userExp) : undefined;
   next();
 }
 ```
@@ -2400,6 +2488,7 @@ declare namespace Express {
     userId?:   string;
     userRole?: string;
     userJti?:  string;    // JWT ID — injected by Gateway, used for blacklisting on logout
+    userExp?:  number;    // JWT exp (unix seconds) — blacklist TTL = exp − now
   }
 }
 ```
@@ -2420,7 +2509,23 @@ export interface JwtPayload {
 
 **`src/middlewares/errorHandler.ts`:**
 ```typescript
-export { globalErrorHandler } from '@skyhub/common-utils';
+export { globalErrorHandler, notFoundHandler } from '@skyhub/common-utils';
+```
+
+**`src/middlewares/requireRole.ts`** — same pattern as Flight Service:
+```typescript
+export function requireRole(...allowed: string[]) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (!req.userRole || !allowed.includes(req.userRole)) {
+      return sendError({
+        res, statusCode: 403, name: 'FORBIDDEN',
+        message: 'Insufficient permissions',
+        traceId: req.headers['x-correlation-id'] as string ?? '',
+      });
+    }
+    next();
+  };
+}
 ```
 
 **Validation:** `npm run typecheck` — zero errors.
@@ -2454,10 +2559,11 @@ deleteExpired(): Promise<number>
 
 **`src/repositories/outbox.repository.ts`** — key methods:
 ```typescript
-create(eventType: string, payload: object): Promise<void>
-getPending(limit: number): Promise<OutboxEvent[]>
+create(tx, eventType, payload): Promise<void>            // accepts Prisma tx — written atomically with the business change
+reclaimStale(): Promise<number>                          // PROCESSING with updated_at older than 2 min → back to PENDING
+claimPending(limit: number): Promise<OutboxEvent[]>      // FOR UPDATE SKIP LOCKED → mark PROCESSING → commit (short tx)
 markPublished(id: string): Promise<void>
-markFailed(id: string): Promise<void>
+retryOrFail(id: string, maxRetries: number): Promise<void> // retry_count+1 → PENDING; FAILED only past the cap
 ```
 
 **Rule:** Every method in a repository is a simple Prisma call. No if/else. No calculations. Just SQL. This is the only layer that imports `prisma`.
@@ -2493,7 +2599,14 @@ async rotateRefreshToken(oldTokenRaw, deviceInfo, ipAddress): Promise<{ newRaw, 
   → if not found → throw AppError('Session invalid or terminated', 401, 'INVALID_REFRESH_TOKEN')
   → if expired → throw AppError('Session expired', 401, 'INVALID_REFRESH_TOKEN')
   → tokenRepository.deleteById(existing.id)
+    ← THE DELETE IS THE ATOMIC GUARD: two concurrent requests with the same token
+      both pass findByHash, but only one delete succeeds — Prisma throws P2025 for
+      the loser. Catch it and map to the same 401 (the token was already rotated,
+      by a parallel tab or by a thief replaying it).
+    ← v2 upgrade (reuse detection): on that P2025/401, revoke ALL of the user's
+      refresh tokens — a replayed rotated-out token is the signature of theft.
   → return createRefreshToken + signAccessToken for existing.userId
+    (store the new access token's jti on the new row's last_jti — powers GET /sessions isCurrent)
 ```
 
 **`src/services/auth.service.ts`** — core logic:
@@ -2548,16 +2661,33 @@ calculateTier(bookingCount: number): LoyaltyTier {
   return LoyaltyTier.SILVER;
 }
 
-async handleBookingCompleted(userId: string): Promise<void> {
-  const user = await userRepository.findById(userId);
-  const newCount = user.bookingCount + 1;
-  const newTier  = this.calculateTier(newCount);
-  await userRepository.updateById(userId, { bookingCount: newCount, loyaltyTier: newTier });
-  if (newTier !== user.loyaltyTier) {
-    await outboxRepository.create('USER_LOYALTY_UPDATED', {
-      userId, previousTier: user.loyaltyTier, newTier,
+// Kafka is at-least-once — this handler MUST be idempotent and race-safe:
+//  • processed_events PK eats replayed events (dedupe in the SAME transaction)
+//  • { increment: 1 } is atomic — no read-modify-write lost update between
+//    two concurrent BOOKING_COMPLETED events for the same user
+//  • bookingCount/loyaltyTier live on UserProfile, not User
+async handleBookingCompleted(eventId: string, userId: string): Promise<void> {
+  await prisma.$transaction(async (tx) => {
+    try {
+      await tx.processedEvent.create({ data: { eventId } });   // idempotency guard
+    } catch (e) {
+      if (isUniqueViolation(e)) return;                        // replay — no-op
+      throw e;
+    }
+
+    const profile = await tx.userProfile.update({
+      where: { userId },
+      data:  { bookingCount: { increment: 1 } },
     });
-  }
+
+    const newTier = this.calculateTier(profile.bookingCount);
+    if (newTier !== profile.loyaltyTier) {
+      await tx.userProfile.update({ where: { userId }, data: { loyaltyTier: newTier } });
+      await outboxRepository.create(tx, 'USER_LOYALTY_UPDATED', {
+        userId, previousTier: profile.loyaltyTier, newTier,
+      });
+    }
+  });
 }
 ```
 
@@ -2585,6 +2715,7 @@ async register(req: Request, res: Response) {
 import { Router } from 'express';
 import { validate } from '../middlewares/validate';
 import { requireAuth } from '../middlewares/requireAuth';
+import { requireRole } from '../middlewares/requireRole';
 import { authController } from '../controllers/auth.controller';
 import * as schemas from './schemas/auth.schemas';
 
@@ -2615,11 +2746,19 @@ router.post('/mfa/enable',          requireAuth, authController.enableMfa);
 router.post('/mfa/verify',          requireAuth, validate(schemas.MfaVerifySchema), authController.verifyMfa);
 router.post('/mfa/login-verify',    validate(schemas.MfaLoginVerifySchema), authController.loginVerifyMfa);
 
-// ─── 5. ADMINISTRATIVE CONTROL ROUTING (Dynamic RBAC Vault) ─────────────────
-router.get('/admin/users',          requireAuth, authController.adminListUsers);
-router.put('/admin/users/:userId/roles', requireAuth, validate(schemas.AdminUpdateRolesSchema), authController.adminUpdateUserRoles);
-
 export { router as authRouter };
+
+// ─── 5. ADMINISTRATIVE CONTROL ROUTING — separate router, mounted at /api/v1/admin ──
+// (NOT inside the auth router: the spec paths are /api/v1/admin/*, and admin routes
+// need a stricter middleware chain.)
+// Defense in depth: the Gateway already checks the role, but the service enforces it
+// AGAIN locally — same requireRole pattern as Flight Service. requireAuth alone would
+// let any logged-in CUSTOMER through if the Gateway check ever regressed.
+const adminRouter = Router();
+adminRouter.get('/users',               requireAuth, requireRole('SUPER_ADMIN'), authController.adminListUsers);
+adminRouter.put('/users/:userId/roles', requireAuth, requireRole('SUPER_ADMIN'), validate(schemas.AdminUpdateRolesSchema), authController.adminUpdateUserRoles);
+
+export { adminRouter };
 ```
 
 **`src/app.ts`:**
@@ -2629,10 +2768,10 @@ import express from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
 import { pinoHttp } from 'pino-http';
-import { authRouter } from './routes/auth.routes';
+import { authRouter, adminRouter } from './routes/auth.routes';
 import { healthRouter } from './routes/health.routes';
 import { jwksRouter } from './routes/jwks.routes';
-import { globalErrorHandler } from './middlewares/errorHandler';
+import { globalErrorHandler, notFoundHandler } from './middlewares/errorHandler';
 import { logger } from './config/logger';
 import { env } from './config/env';
 
@@ -2642,16 +2781,18 @@ app.use(helmet());
 app.use(cors({ origin: false }));     // No direct browser access — Gateway handles CORS
 app.use(pinoHttp({ logger }));
 
-// Raw body for Stripe webhooks (if added later)
-app.use('/api/v1/webhooks', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '10kb' }));  // Limit request body size
+// (No webhook raw-body route here — Stripe webhooks belong to the Payment Service.)
 
 // Routes
 app.use('/api/v1/auth', authRouter);
+app.use('/api/v1/admin', adminRouter);
 app.use('/.well-known', jwksRouter);
-app.use('/', healthRouter);
+app.use('/api/v1', healthRouter);   // GET /api/v1/health (cluster convention)
 
-// Global error handler — must be last
+// 404 fallback — after all routes, before the error handler (from common-utils)
+app.use(notFoundHandler);
+// Global error handler — must be last (4-arg)
 app.use(globalErrorHandler);
 
 export { app };
@@ -2701,6 +2842,11 @@ async function bootstrap() {
       logger.info('Graceful shutdown complete');
       process.exit(0);
     });
+    // Force-exit backstop — a hung connection must never block shutdown forever
+    setTimeout(() => {
+      logger.error('Forced shutdown after 10s timeout');
+      process.exit(1);
+    }, 10_000).unref();
   };
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -2718,7 +2864,7 @@ bootstrap().catch(err => {
 import { Router } from 'express';
 import { prisma } from '../config/database.js';
 import { redisClient } from '../config/redis.js';
-import { kafkaProducer } from '../config/kafka.js';
+import { isKafkaConnected } from '../config/kafka.js';
 
 const router = Router();
 
@@ -2739,12 +2885,12 @@ router.get('/health', async (_req, res) => {
     checks.redis = `error: ${(e as Error).message}`;
   }
 
-  try {
-    // kafkaProducer.isConnected() is the lightest check — no network call
-    checks.kafka = kafkaProducer ? 'ok' : 'not connected';
-  } catch (e) {
-    checks.kafka = `error: ${(e as Error).message}`;
-  }
+  // kafkajs exposes no isConnected() — and `kafkaProducer ? 'ok'` would always be
+  // truthy (it's just the object). Track real state via producer lifecycle events:
+  //   kafkaProducer.on('producer.connect',    () => { kafkaUp = true;  })
+  //   kafkaProducer.on('producer.disconnect', () => { kafkaUp = false; })
+  // in kafka.ts, exported as isKafkaConnected().
+  checks.kafka = isKafkaConnected() ? 'ok' : 'error: not connected';
 
   const healthy = Object.values(checks).every(v => v === 'ok');
   res.status(healthy ? 200 : 503).json({
@@ -2783,35 +2929,52 @@ import { metricsRouter } from './routes/metrics.routes.js';
 app.use('/', metricsRouter);   // GET /metrics — Prometheus scrape endpoint
 ```
 
-**Validation:** `npm run dev` — server starts, logs `User service listening on port 3001`. Hit `GET http://localhost:3001/health` — returns `{ status: "healthy" }`. Hit `GET http://localhost:3001/metrics` — returns Prometheus text. Hit `POST http://localhost:3001/api/v1/auth/register` with valid body — returns `201 Created`.
+**Validation:** `npm run dev` — server starts, logs `User service listening on port 3001`. Hit `GET http://localhost:3001/api/v1/health` — returns `{ status: "healthy" }`. Hit `GET http://localhost:3001/metrics` — returns Prometheus text. Hit `POST http://localhost:3001/api/v1/auth/register` with valid body — returns `201 Created`.
 
 ---
 
 ### Step 7: Outbox Worker & Kafka Events
 
-**`src/events/outbox.worker.ts`:**
+**`src/events/outbox.worker.ts`** — same design as Flight Service (doc 04, Feature 13):
 ```typescript
 import { outboxRepository } from '../repositories/outbox.repository';
 import { userProducer } from './producers/user.producer';
 import { logger } from '../config/logger';
 
+const POLL_MS = 5000;
+const MAX_RETRIES = 10;
+
+// Recursive setTimeout, NOT setInterval — a slow tick (Kafka backpressure)
+// can never overlap the next one and double-claim the same events.
 export function startOutboxWorker(): void {
-  setInterval(async () => {
+  const tick = async () => {
     try {
-      const pending = await outboxRepository.getPending(100);
-      for (const event of pending) {
+      // 1. Reclaim events stranded in PROCESSING (a previous worker crashed mid-publish)
+      await outboxRepository.reclaimStale();
+
+      // 2. Claim a batch: PENDING → PROCESSING in one short transaction
+      //    (FOR UPDATE SKIP LOCKED — commit before any network call)
+      const batch = await outboxRepository.claimPending(100);
+
+      for (const event of batch) {
         try {
           await userProducer.publish(event.eventType, event.payload);
           await outboxRepository.markPublished(event.id);
         } catch (err) {
-          logger.error({ eventId: event.id, err }, 'Failed to publish outbox event');
-          await outboxRepository.markFailed(event.id);
+          logger.error({ eventId: event.id, err }, 'Publish failed — will retry');
+          // Back to PENDING with retry_count+1; FAILED only past MAX_RETRIES.
+          // Marking FAILED on the FIRST failure would permanently strand events
+          // behind any transient Kafka outage.
+          await outboxRepository.retryOrFail(event.id, MAX_RETRIES);
         }
       }
     } catch (err) {
-      logger.error(err, 'Outbox worker error');
+      logger.error(err, 'Outbox worker tick error');
+    } finally {
+      setTimeout(tick, POLL_MS);
     }
-  }, 5000);  // Poll every 5 seconds
+  };
+  setTimeout(tick, POLL_MS);
 }
 ```
 
@@ -2860,12 +3023,12 @@ export async function startBookingConsumer(): Promise<void> {
       const event = JSON.parse(message.value?.toString() ?? '{}');
       if (event.eventType !== 'BOOKING_COMPLETED') return;
 
-      try {
-        await loyaltyService.handleBookingCompleted(event.payload.userId);
-        logger.info({ userId: event.payload.userId }, 'Booking count updated');
-      } catch (err) {
-        logger.error({ err, event }, 'Failed to handle BOOKING_COMPLETED');
-      }
+      // Deliberately NO try/catch here: if the handler throws, kafkajs does NOT
+      // commit the offset and redelivers the message — swallowing the error would
+      // commit past a lost event (at-most-once). Replays are safe because the
+      // handler dedupes by eventId (processed_events PK).
+      await loyaltyService.handleBookingCompleted(event.eventId, event.payload.userId);
+      logger.info({ userId: event.payload.userId }, 'Booking count updated');
     },
   });
 }
@@ -3040,4 +3203,4 @@ Step 8  ✓  JWKS endpoint returning public key in JWK format
 Step 9  ✓  Integration tests pass for all 12 validation checklist items
 ```
 
-Once all 9 steps pass their validation, Phase 1 (User Service) is complete and production-ready. Proceed to Phase 2: Flight Service.
+Once all 9 steps pass their validation, the User Service v1 is complete. Per [`00_Build_Roadmap.md`](00_Build_Roadmap.md) this is **Phase 2** (together with the API Gateway) — Flight Service was Phase 1. Next up: Phase 3, the Search Service.

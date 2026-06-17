@@ -17,6 +17,20 @@
 
 ---
 
+## ⚠️ Build Scope — Read Before Building Anything
+
+This is **Phase 1** of [`00_Build_Roadmap.md`](00_Build_Roadmap.md) — the first service built. Foundations built here (Zod env config, Pino, error pipeline, layering) are reused by every later service, so build them properly once.
+
+| Stage | Features |
+|---|---|
+| **v1 — Phase 1 (now)** | Full schema + migration + seed script · Airport/Aircraft/Schedule/Instance CRUD (Features 1–7, 10–12) · **hold / release / confirm seats with `FOR UPDATE` + `seat_holds` table** (Features 8, 9, 9a) · **hold-expiry sweeper** (Feature 9b) · health check (Feature 14). Outbox **rows are written** in every mutation transaction from day one — but the outbox *worker* is not built yet. |
+| **v2 — Phase 3** | Outbox Worker + Kafka producer (Feature 13) — built when Search Service exists to consume the events. |
+| **Deferred to Phase 8** | `/metrics` (Feature 15), OpenTelemetry. |
+
+**RBAC note for v1:** the Gateway doesn't exist until Phase 2, so admin routes initially trust an `X-User-Role` header set manually in your `.http` files. The middleware is real; only the header's source is temporary. When the Gateway lands in Phase 2, nothing in this service changes.
+
+---
+
 ## 1. Bounded Context & Responsibility
 
 The Flight Service is the **exclusive write-side owner of the flight catalog and seat inventory**. It is the single source of truth for everything flight-related. No other service may write to `skyhub_flight_db` or modify `available_seats` directly.
@@ -88,7 +102,7 @@ BOOKING SERVICE (internal network only — never via Gateway)
 
 **Data contract with other services:**
 - **Search Service** receives flight data exclusively via Kafka events (`FLIGHT_UPDATED`, `SEATS_HELD`, `SEATS_RELEASED`, `FLIGHT_CANCELLED`)
-- **Booking Service** calls Flight Service synchronously via HTTP internal endpoints (`/internal/flights/instances/:id/hold-seats`, `/internal/flights/instances/:id/release-seats`) — these are the ONLY cross-service HTTP calls Flight Service receives
+- **Booking Service** calls Flight Service synchronously via HTTP internal endpoints (`/internal/flights/instances/:id/hold-seats`, `/internal/flights/instances/:id/release-seats`, `/internal/flights/instances/:id/confirm-seats`) — these are the ONLY cross-service HTTP calls Flight Service receives
 - **API Gateway** proxies public read + admin write routes to Flight Service
 
 ---
@@ -176,6 +190,7 @@ BOOKING SERVICE (internal network only — never via Gateway)
 **Rules:**
 - `availableSeats` cannot exceed `totalSeats` → 422 if violated
 - `availableSeats` cannot go below 0 → 422 if violated
+- If only one of (`totalSeats`, `availableSeats`) is provided, the rule is checked against the **stored** value of the other — e.g. lowering `totalSeats` 200→150 while stored `availableSeats` is 180 → 422. Zod can only validate the pair when both are sent; without this service-level check the `chk_available_seats` DB constraint fires → unhandled 500 instead of a clean 422
 - Changing `basePrice` publishes a `FLIGHT_UPDATED` Kafka event so the Search Service reflects the new price
 - Changing `totalSeats` also triggers `FLIGHT_UPDATED`
 
@@ -186,10 +201,11 @@ BOOKING SERVICE (internal network only — never via Gateway)
    - Fetch the associated `Aircraft` capacity via `schedule.aircraftId`.
    - Calculate the new proposed sum of `totalSeats` across all inventories of the flight instance (replacing the old value of the targeted inventory with the new value).
    - Validate that `proposed_sum <= aircraft.totalCapacity` → 422 if it exceeds capacity.
-4. In ONE transaction:
+4. Validate the effective pair — request values where provided, stored values otherwise — satisfies `0 <= availableSeats <= totalSeats` → 422 if violated
+5. In ONE transaction:
    - `UPDATE seat_inventories SET ...`
    - If `basePrice` or `totalSeats` or `availableSeats` changed: `INSERT INTO outbox_events (FLIGHT_UPDATED, {full denormalized payload})`
-5. Return `200 OK` with the updated inventory
+6. Return `200 OK` with the updated inventory
 
 ---
 
@@ -236,6 +252,11 @@ BOOKING SERVICE (internal network only — never via Gateway)
    - One outbox row per inventory bucket so the Search Service can delete each MongoDB document by `inventoryId`
 4. Return `200 OK`
 
+**ACTIVE holds on a cancelled flight:** cancellation deliberately does NOT touch `seat_holds` rows — a payment may be mid-flight for one of them. Instead the hold endpoints become status-aware:
+- **release** (Feature 9, Step B0): transitions the hold to RELEASED/EXPIRED but **skips the inventory increment and the `SEATS_RELEASED` outbox row** — inventory was zeroed at cancel time, the search document is already deleted, and re-publishing a seat count could resurrect stale state.
+- **confirm** (Feature 9a): returns `409 FLIGHT_CANCELLED` so the Booking Service refunds instead of confirming a seat on a flight that no longer operates.
+- Paid/confirmed bookings on the cancelled flight are refunded by the Booking Service's `FLIGHT_CANCELLED` consumer (Phase 4).
+
 **Booking Service consideration:**
 Cancelling a flight with confirmed bookings triggers compensating transactions. The Flight Service only publishes `FLIGHT_CANCELLED`. The Booking Service (Phase 4) consumes this event to initiate refund sagas.
 
@@ -260,9 +281,14 @@ ACID guarantee — two users requesting the last 2 seats at the same millisecond
 
 2. Flight Service executes (inside Prisma $transaction):
 
-   Step A: Idempotency Guard
-   SELECT payload FROM outbox_events WHERE event_type = 'SEATS_HELD' AND payload->>'bookingId' = {bookingId}
-   IF found → return 200 with stored remainingSeats & heldUntil (no updates performed)
+   Step A: Idempotency Guard — the seat_holds table IS the idempotency store
+   SELECT * FROM seat_holds WHERE booking_id = {bookingId}
+   IF found → return 200 with the stored hold's remainingSeats & heldUntil (no updates performed)
+   ← bookingId is the PRIMARY KEY of seat_holds: even if two duplicate requests race past
+     this check, the second INSERT in Step E violates the PK and the transaction rolls
+     back harmlessly. State-table idempotency > event-log-lookup idempotency: it is
+     indexed, it has explicit lifecycle states, and it decouples "what happened"
+     (outbox) from "what is true now" (seat_holds).
 
    Step B: Find inventory bucket and acquire row lock
    SELECT id, available_seats, total_seats
@@ -283,20 +309,29 @@ ACID guarantee — two users requesting the last 2 seats at the same millisecond
      ROLLBACK (lock released)
      Return 409 { code: 'INSUFFICIENT_SEATS', availableSeats: inventory.available_seats }
 
-   Step E: Decrement seats + write outbox (atomic)
+   Step E: Decrement seats + record the hold + write outbox (all atomic)
    UPDATE seat_inventories
      SET available_seats = available_seats - {seats}
    WHERE id = {inventory.id}
 
+   INSERT INTO seat_holds
+     (booking_id={bookingId}, inventory_id={inventory.id}, seats={seats},
+      status='ACTIVE', held_until=NOW() + 15 minutes)
+
    INSERT INTO outbox_events
      (event_type='SEATS_HELD',
-      payload={ inventoryId, seatsHeld: seats, remainingSeats: updated.available_seats,
-                heldUntil: NOW() + 15 minutes, bookingId })
+      payload={ flightInstanceId, inventoryId, seatsHeld: seats,
+                remainingSeats: updated.available_seats,        ← ABSOLUTE value, not a delta —
+                heldUntil, bookingId })                            consumers SET, never decrement
+                                                                   (at-least-once safety)
 
    COMMIT (lock released — next waiting transaction can proceed)
 
 3. Return 200 { success: true, remainingSeats: <updated count>, heldUntil: <ISO string> }
 ```
+
+**Why an explicit `seat_holds` row instead of just decrementing the counter?**
+A bare decrement destroys information: the inventory row says "8 seats" but nothing says *who* holds the other 2, *until when*, or *whether their booking completed*. The `seat_holds` row makes the hold a first-class entity with a lifecycle (`ACTIVE → CONFIRMED | RELEASED | EXPIRED`), which buys three things at once: (1) free idempotency via the PK, (2) the hold-expiry sweeper becomes possible (Feature 9b), and (3) the system is auditable — you can answer "why is this flight showing 8 seats?" by reading rows instead of replaying logs.
 
 **Concurrent hold behaviour:**
 - Request A arrives: locks row, sees 10 seats, decrements to 8, commits, releases lock
@@ -319,30 +354,118 @@ ACID guarantee — two users requesting the last 2 seats at the same millisecond
 
 2. Flight Service executes (inside Prisma $transaction):
 
-   Step A: Idempotency Guard
-   SELECT payload FROM outbox_events WHERE event_type = 'SEATS_RELEASED' AND payload->>'bookingId' = {bookingId}
-   IF found → return 200 with stored remainingSeats immediately (no updates performed)
+   Step A: Load the hold — its status column IS the idempotency guard
+   SELECT * FROM seat_holds WHERE booking_id = {bookingId} FOR UPDATE
+   ← row lock on the hold prevents the race where the BullMQ timeout job and a saga
+     rollback try to release the same hold simultaneously
+   IF not found            → 404 HOLD_NOT_FOUND
+   IF status != 'ACTIVE'   → return 200 with stored remainingSeats (already released,
+                              expired, or confirmed — releasing twice must be a no-op)
 
-   Step B: Find inventory
-   Find SeatInventory by (flightInstanceId + cabinClass + fareClass) → 404 if not found
-   (No FOR UPDATE lock needed — incrementing seats cannot cause double-booking)
+   Step B0: Cancelled-flight guard
+   SELECT status FROM flight_instances (via hold.inventory_id → flight_instance_id)
+   IF status = 'CANCELLED':
+     UPDATE seat_holds SET status='RELEASED', released_at=NOW()
+     COMMIT → 200 (NO inventory increment, NO outbox row — inventory was zeroed
+     at cancel time and the Search document is already deleted; a SEATS_RELEASED
+     event here could re-create stale state. See Feature 7.)
 
-   Step C: Increment seats + write outbox (atomic)
+   Step B: Increment seats + transition hold + write outbox (all atomic)
    UPDATE seat_inventories
-     SET available_seats = LEAST(available_seats + {seats}, total_seats)
-   WHERE id = {inventory.id}
+     SET available_seats = LEAST(available_seats + {hold.seats}, total_seats)
+   WHERE id = {hold.inventory_id}
+   ← seats count comes from the HOLD ROW, not the request body — the caller
+     cannot release more seats than were actually held
+   ← LEAST() guard: belt-and-suspenders so available_seats can never exceed total_seats
 
-   ← LEAST() guard: available_seats can never exceed total_seats
-     even if release is called twice (idempotency guard)
+   UPDATE seat_holds SET status = 'RELEASED', released_at = NOW()
+   WHERE booking_id = {bookingId}
 
    INSERT INTO outbox_events
      (event_type='SEATS_RELEASED',
-      payload={ inventoryId, seatsReleased: seats, remainingSeats: updated.available_seats, bookingId })
+      payload={ flightInstanceId, inventoryId, seatsReleased: hold.seats,
+                remainingSeats: updated.available_seats, bookingId })
 
    COMMIT
 
 3. Return 200 { success: true, remainingSeats: <updated count> }
 ```
+
+---
+
+### Feature 9a: Confirm Seats (Internal — Booking Service Only)
+
+**`PATCH /internal/flights/instances/:id/confirm-seats` — Body: `{ bookingId }`**
+
+**Triggered by:** Booking Service when `PAYMENT_SUCCESS` confirms the booking (via its outbox, so it retries until it lands).
+
+**Why this endpoint must exist:** without it, Flight Service can never distinguish "user paid, seats are sold" from "user abandoned checkout, seats are leaking." The hold would look ACTIVE-and-expired forever, and the sweeper (Feature 9b) would wrongly release seats that were *paid for*. Confirming a hold is the inventory-side completion of the saga.
+
+**Flow (inside Prisma $transaction):**
+```
+1. SELECT * FROM seat_holds WHERE booking_id = {bookingId} FOR UPDATE
+   IF not found              → 404 HOLD_NOT_FOUND (ops alert — saga inconsistency)
+   IF status = 'CONFIRMED'   → 200 (idempotent replay — outbox may deliver twice)
+   IF status = 'RELEASED' or 'EXPIRED'
+       → 409 HOLD_ALREADY_RELEASED
+         ← This is the saga's worst edge case: payment succeeded AFTER the hold
+           expired (e.g., user paid at minute 14:59, message arrived at 15:01,
+           sweeper fired in between). Booking Service must handle this 409 by
+           re-attempting a fresh hold-seats call; if THAT fails (flight sold out),
+           it refunds the payment. Document this path — interviewers love it.
+   IF instance status = 'CANCELLED' (via hold.inventory_id → flight_instance)
+       → 409 FLIGHT_CANCELLED
+         ← payment succeeded but the flight was cancelled while the saga was in
+           flight. Booking must NOT confirm — re-holding is impossible on a
+           cancelled flight, so it refunds. (See Feature 7.)
+
+2. UPDATE seat_holds SET status = 'CONFIRMED', confirmed_at = NOW()
+   (No inventory change — the seats were already decremented at hold time.
+    Confirmation just makes the decrement permanent.)
+
+3. COMMIT → 200 { success: true }
+```
+
+---
+
+### Feature 9b: Hold-Expiry Sweeper (Background — Reconciliation Loop)
+
+**The problem:** the *normal* expiry path is Booking Service's BullMQ `seat-timeout-queue` job calling `/release-seats` after 15 minutes. But that path depends on Booking Service AND `redis-core` both being alive at the right moment. If either is down, ACTIVE holds outlive `held_until` forever and inventory leaks — seats nobody can ever book.
+
+**The principle (memorize this):** *event-driven cleanup is an optimization; a reconciliation loop against the source of truth is the guarantee.* Flight Service owns seat inventory, so Flight Service guarantees holds cannot leak — regardless of what any other service does.
+
+```typescript
+// src/workers/holdExpiry.worker.ts — started in server.ts, runs every 60s
+setInterval(async () => {
+  const expired = await prisma.seatHold.findMany({
+    where: { status: 'ACTIVE', heldUntil: { lt: new Date() } },
+    take: 100,                       // bounded batch — never unbounded scans
+  });
+  for (const hold of expired) {
+    try {
+      await seatHoldService.releaseHold(hold.bookingId, 'EXPIRED');
+      // same transactional path as Feature 9, but sets status='EXPIRED' (not RELEASED)
+      // so we can tell sweeper-released from booking-released in the data
+      logger.warn({ bookingId: hold.bookingId }, 'Sweeper released expired hold');
+    } catch (err) {
+      logger.error({ err, bookingId: hold.bookingId }, 'Sweeper release failed — retried next tick');
+    }
+  }
+}, 60_000);
+```
+
+**Race-safety matrix (every pair of release paths is safe):**
+
+| First to act | Second to act | Outcome |
+|---|---|---|
+| BullMQ timeout job (status → RELEASED) | Sweeper | Sweeper's `status='ACTIVE'` filter skips it — no-op |
+| Sweeper (status → EXPIRED) | BullMQ timeout job | Release endpoint sees non-ACTIVE → returns 200, no inventory change |
+| Confirm (status → CONFIRMED) | Sweeper | Sweeper never selects CONFIRMED — paid seats are never released |
+| Sweeper (status → EXPIRED) | Late confirm | Confirm returns 409 → Booking re-holds or refunds (see Feature 9a) |
+
+The `FOR UPDATE` lock on the `seat_holds` row (Features 9/9a) makes even *simultaneous* execution of two paths serialize correctly.
+
+**Index that powers the sweeper:** `@@index([status, heldUntil])` — the poll is a cheap index range scan, not a table scan.
 
 ---
 
@@ -386,7 +509,7 @@ Schedules are created via `POST /api/v1/flights/schedules` but without GET/PATCH
 **Operations (beyond existing POST):**
 - `GET /api/v1/flights/schedules` — list schedules (filter by route, airline)
 - `GET /api/v1/flights/schedules/:id` — get single schedule
-- `PATCH /api/v1/flights/schedules/:id` — update aircraft, amenities, times
+- `PATCH /api/v1/flights/schedules/:id` — update aircraft, amenities, times (fans out `FLIGHT_UPDATED` outbox rows to all future instances — see Endpoint 12)
 - `DELETE /api/v1/flights/schedules/:id` — discontinue route via soft-delete (`isActive = false`) (only if no active `SCHEDULED` or `BOARDING` instances exist)
 
 ---
@@ -396,21 +519,24 @@ Schedules are created via `POST /api/v1/flights/schedules` but without GET/PATCH
 Runs as a recursive `setTimeout` loop (with `OUTBOX_POLL_INTERVAL_MS` delay) inside the service process to prevent overlapping runs.
 
 **What it does:**
-1. In a quick database transaction, select pending events and mark them as processing to prevent overlap:
+1. **Reclaim stranded events first:**
+   `UPDATE outbox_events SET status = 'PENDING' WHERE status = 'PROCESSING' AND updated_at < NOW() - INTERVAL '2 minutes'`
+   Without this, a worker crash between "mark PROCESSING" (step 2) and "publish" (step 3) strands those events forever — the poller only selects PENDING, silently defeating the outbox guarantee. If the crash happened *after* a successful publish but *before* marking PUBLISHED, the reclaimed event publishes twice — that is fine: delivery is at-least-once by contract and all consumers are idempotent.
+2. In a quick database transaction, select pending events and mark them as processing to prevent overlap:
    `SELECT * FROM outbox_events WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT 100 FOR UPDATE SKIP LOCKED`
    Immediately execute `UPDATE outbox_events SET status = 'PROCESSING' WHERE id IN (...)` and COMMIT the transaction. This releases the row locks and connection immediately, avoiding keeping database transactions open during network calls.
-2. In the application code, iterate through the fetched events:
+3. In the application code, iterate through the fetched events:
    - Serialize as standard Kafka envelope (see Section 7)
    - Publish to Kafka topic `flight-inventory-events` with `inventoryId` as the partition key
    - On success: Run a quick transaction to `UPDATE outbox_events SET status='PUBLISHED', published_at=NOW() WHERE id = {id}`
    - On failure: Run a quick transaction to `UPDATE outbox_events SET status='PENDING' WHERE id = {id}` (or increment retry count, or mark as `FAILED` if max retries exceeded)
-3. Never deletes outbox rows — keep for audit trail and debugging
+4. Never deletes outbox rows — keep for audit trail and debugging
 
 ---
 
 ### Feature 14: Health Check
 
-**`GET /health`** — checks PostgreSQL connection and Kafka producer connection
+**`GET /api/v1/health`** — checks PostgreSQL connection (`SELECT 1`) and returns per-dependency status (`healthy` 200 / `degraded` 503). Routes are versioned under `/api/v1` from day one; the Kafka producer check is added in Phase 3 when the producer exists. *(Implemented.)*
 
 ---
 
@@ -508,6 +634,7 @@ Flight Service-specific metrics:
 │                          FAILED)                                         │
 │ retry_count  INT         DEFAULT 0                                       │
 │ created_at   TIMESTAMPTZ NOT NULL                                        │
+│ updated_at   TIMESTAMPTZ AUTO UPDATE ← stale-PROCESSING reclaim          │
 │ published_at TIMESTAMPTZ NULL                                            │
 └─────────────────────────────────────────────────────────────────────────┘
 Note: OutboxEvent has NO FK to any flight table — events are generic.
@@ -565,6 +692,7 @@ The Flight Service does NOT call User Service to validate this UUID. It trusts t
 | `payload` | JSONB — full Kafka envelope stored |
 | `status` | ENUM: `PENDING \| PROCESSING \| PUBLISHED \| FAILED` |
 | `retry_count` | INT — Track number of publication retries to handle poison pill events |
+| `updated_at` | Auto-updated on every status change — the stale-`PROCESSING` reclaim query (Feature 13 step 1) filters on it |
 
 ### 3.3 Database Constraints (CHECK constraints)
 
@@ -594,16 +722,18 @@ ALTER TABLE flight_schedules
 
 ### 3.4 Complete Prisma Schema
 
-**File: `services/flight-service/prisma/schema.prisma`**
+**File: `services/flight-service/src/db/schema.prisma`**
+
+> **Prisma 7 layout (as implemented):** the schema lives at `src/db/schema.prisma`, migrations at `src/db/migrations/`, and the generated client at `src/db/generated/prisma/` (gitignored). The datasource `url` is **not** in the schema — it comes from `src/config/prisma.config.ts` (Prisma 7 `defineConfig`), and every Prisma CLI command runs with `--config src/config/prisma.config.ts` (wrapped by the `db:*` npm scripts). At runtime the client is constructed with the `pg` driver adapter: `new PrismaClient({ adapter: new PrismaPg(pool) })`.
 
 ```prisma
 generator client {
   provider = "prisma-client-js"
+  output   = "./generated/prisma"
 }
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
@@ -627,6 +757,13 @@ enum OutboxStatus {
   PROCESSING
   PUBLISHED
   FAILED
+}
+
+enum HoldStatus {
+  ACTIVE     // seats decremented, awaiting payment outcome
+  CONFIRMED  // payment succeeded — decrement is now permanent
+  RELEASED   // released by Booking Service (rollback or timeout job)
+  EXPIRED    // released by the hold-expiry sweeper (Feature 9b)
 }
 
 // ─── Models ───────────────────────────────────────────────────────────────────
@@ -716,9 +853,29 @@ model SeatInventory {
   refundable       Boolean        @default(false)
 
   flightInstance   FlightInstance @relation(fields: [flightInstanceId], references: [id], onDelete: Cascade)
+  holds            SeatHold[]
 
   @@unique([flightInstanceId, cabinClass, fareClass], name: "uq_inventory_bucket")
   @@map("seat_inventories")
+}
+
+// Every hold is a first-class row with a lifecycle — NOT just a counter decrement.
+// PK = bookingId gives free idempotency; (status, heldUntil) index powers the sweeper.
+model SeatHold {
+  bookingId   String        @id @map("booking_id")
+  inventoryId String        @map("inventory_id")
+  seats       Int
+  status      HoldStatus    @default(ACTIVE)
+  heldUntil   DateTime      @map("held_until") @db.Timestamptz
+  confirmedAt DateTime?     @map("confirmed_at") @db.Timestamptz
+  releasedAt  DateTime?     @map("released_at") @db.Timestamptz
+  createdAt   DateTime      @default(now()) @map("created_at")
+
+  inventory   SeatInventory @relation(fields: [inventoryId], references: [id], onDelete: Cascade)
+
+  @@index([status, heldUntil], name: "idx_hold_sweeper")
+  @@index([inventoryId])
+  @@map("seat_holds")
 }
 
 model OutboxEvent {
@@ -728,6 +885,7 @@ model OutboxEvent {
   status      OutboxStatus @default(PENDING)
   retryCount  Int          @default(0) @map("retry_count")
   createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")    // powers the stale-PROCESSING reclaim
   publishedAt DateTime?    @map("published_at")
 
   @@index([status, createdAt])
@@ -744,6 +902,8 @@ model OutboxEvent {
 | `uq_flight_instance` | `(scheduleId, departureDate)` | Unique | Block duplicate flights on same route same day |
 | `idx_instance_date` | `departureDate` | B-Tree | Quick filtering of operational dates |
 | `uq_inventory_bucket` | `(flightInstanceId, cabinClass, fareClass)` | Unique | Enforce unique pricing buckets per class |
+| `seat_holds` PK | `booking_id` | Primary Key | One hold per booking — free idempotency for hold/release/confirm |
+| `idx_hold_sweeper` | `(status, heldUntil)` on `seat_holds` | B-Tree | Sweeper poll: `WHERE status='ACTIVE' AND held_until < NOW()` is an index range scan |
 | `idx_schedule_created_at` | `createdAt` on `flight_schedules` | B-Tree | Powers `sortBy=CREATED_AT` on admin schedule list |
 | `(status, createdAt)` on outbox | Compound | B-Tree | Outbox Worker polling query |
 
@@ -808,6 +968,7 @@ Read X-User-Role header
 | `PATCH /api/v1/flights/instances/:instanceId/inventories/:inventoryId` | `FLIGHT_ADMIN` |
 | `/internal/flights/instances/:id/hold-seats` | No JWT — `X-Internal-Secret` header only |
 | `/internal/flights/instances/:id/release-seats` | No JWT — `X-Internal-Secret` header only |
+| `/internal/flights/instances/:id/confirm-seats` | No JWT — `X-Internal-Secret` header only |
 
 ### 4.2 Internal Endpoint Protection
 
@@ -828,13 +989,11 @@ export function internalAuth(req: Request, res: Response, next: NextFunction) {
 
 **In Kubernetes production:** NetworkPolicy restricts which pods can reach port 3002/internal. mTLS adds certificate-based authentication. The shared secret remains as defense-in-depth.
 
-**In the Express app:**
+**In the Express app (versioned-router convention, as implemented):**
 ```
-app.use('/api/v1/airports',  airportRouter)               ← Gateway proxies these
-app.use('/api/v1/aircrafts', aircraftRouter)              ← Gateway proxies these
-app.use('/api/v1/flights',   publicFlightRouter)          ← Gateway proxies these
-app.use('/internal/flights', internalAuth, internalRouter) ← internal services only
-app.use('/',                 healthRouter)
+app.use('/api', indexRouter)                                ← /api/v1/airports, /api/v1/aircrafts,
+                                                              /api/v1/flights, /api/v1/health — Gateway proxies these
+app.use('/internal/flights', internalAuth, internalRouter)  ← internal services only, never proxied
 ```
 
 ### 4.3 Input Validation Security
@@ -907,9 +1066,11 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 
 ---
 
-### Endpoint 2: GET /api/v1/airports/:id
+### Endpoint 2: GET /api/v1/airports/:code
 
 **Auth required:** No (public — used for UI autocomplete)
+
+**Path param:** `code` — IATA 3-letter code, validated by `AirportParamsSchema` (Section 6)
 
 **Success Response — 200 OK:**
 ```json
@@ -930,7 +1091,7 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 
 **Error Responses:**
 ```
-404 NOT_FOUND   → Airport ID does not exist
+404 NOT_FOUND   → Airport code does not exist
 ```
 
 ---
@@ -975,9 +1136,11 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 
 ---
 
-### Endpoint 4: PATCH /api/v1/airports/:id
+### Endpoint 4: PATCH /api/v1/airports/:code
 
 **Auth required:** Yes — `SUPER_ADMIN` only
+
+**Path param:** `code` — IATA 3-letter code (the `code` itself is immutable; it is the lookup key)
 
 **Request Body (all fields optional):**
 ```json
@@ -1007,7 +1170,7 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 **Error Responses:**
 ```
 400 VALIDATION_ERROR   → Zod failed
-404 NOT_FOUND          → Airport ID does not exist
+404 NOT_FOUND          → Airport code does not exist
 ```
 
 ---
@@ -1279,6 +1442,8 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 
 **What is NOT updatable:**
 - `flightNumber`, `originCode`, `destinationCode`, `airline` — define the route identity; cancel and recreate if these need to change
+
+**Search-sync fan-out (required):** every updatable field here (`departureTime`, `arrivalTime`, `durationMinutes`, `aircraftId`, `amenities`) is denormalized into the Search Service's documents. The update transaction must therefore write one `FLIGHT_UPDATED` outbox row per `SeatInventory` bucket of every **future, non-cancelled** instance of this schedule (`status = 'SCHEDULED' AND departure_date >= today`). Without this fan-out, §7.3's "published on schedule update" never actually happens and every future instance's search result is permanently stale. Scale check: 90 future instances × 2 buckets = 180 outbox rows in one transaction — fine; if a route ever has thousands of future instances, chunk the enqueue.
 
 **Request Body (all fields optional):**
 ```json
@@ -1651,7 +1816,8 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 400 VALIDATION_ERROR          → Zod failed (negative price, invalid seats, unknown baggage keys)
 403 FORBIDDEN                 → inventoryId does not belong to the given instanceId
 404 NOT_FOUND                 → instanceId or inventoryId does not exist
-422 BUSINESS_RULE_VIOLATION   → availableSeats > totalSeats, or availableSeats < 0
+422 BUSINESS_RULE_VIOLATION   → availableSeats > totalSeats (checked against stored values
+                                when only one side is provided), or availableSeats < 0
 ```
 
 ---
@@ -1723,21 +1889,60 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 }
 ```
 
-**This endpoint is idempotent.** `LEAST(available + seats, totalSeats)` ensures capacity cannot overflow even if called twice.
+**This endpoint is idempotent.** The hold's `status` column is the guard: releasing a non-ACTIVE hold returns 200 without touching inventory. The seat count is taken from the `seat_holds` row (not the request body), and `LEAST(available + seats, totalSeats)` is a final overflow guard.
+
+**Cancelled-flight behavior:** if the parent flight instance is CANCELLED, the hold is transitioned to RELEASED but inventory is not touched and no `SEATS_RELEASED` event is published (see Feature 9 Step B0 / Feature 7). Still returns 200.
 
 **Error Responses:**
 ```
 400 VALIDATION_ERROR   → required fields missing
-404 NOT_FOUND          → Flight instance or inventory bucket not found
+404 HOLD_NOT_FOUND     → no seat_holds row for this bookingId
+```
+
+---
+
+### Endpoint 21b: PATCH /internal/flights/instances/:id/confirm-seats
+
+**Auth required:** No JWT — `X-Internal-Secret` header only (internal network)
+
+**Called by:** Booking Service outbox worker after `PAYMENT_SUCCESS` (retried until delivered).
+
+**Request Body:**
+```json
+{
+  "bookingId": "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+}
+```
+
+**Success Response — 200 OK:**
+```json
+{
+  "success": true,
+  "status":  "CONFIRMED"
+}
+```
+
+**Behavior:** Transitions the `seat_holds` row `ACTIVE → CONFIRMED` (no inventory change — seats were decremented at hold time; confirmation makes it permanent and shields it from the sweeper). Idempotent: an already-CONFIRMED hold returns 200.
+
+**Error Responses:**
+```
+404 HOLD_NOT_FOUND         → no seat_holds row for this bookingId (saga inconsistency — alert)
+409 HOLD_ALREADY_RELEASED  → hold expired/released before payment landed.
+                             Booking Service must re-attempt hold-seats; if sold out → refund.
+                             (See Feature 9a for this edge case in full.)
+409 FLIGHT_CANCELLED       → flight was cancelled while payment was in flight.
+                             Booking must refund — re-holding is impossible. (See Feature 7.)
 ```
 
 ---
 
 ## 5.7 Observability Endpoints
 
-### Endpoint 22: GET /health
+### Endpoint 22: GET /api/v1/health
 
 **Auth required:** No
+
+*(Kafka check applies from Phase 3, when the producer exists — until then `checks` contains only `database`.)*
 
 **Healthy Response — 200 OK:**
 ```json
@@ -1784,7 +1989,7 @@ Returns Prometheus scrape text with:
 
 ## 6. Zod Validation Schemas
 
-**File: `src/routes/schemas/flight.schemas.ts`**
+**File: `src/routers/schemas/flight.schemas.ts`**
 
 ### AirportParamsSchema
 ```
@@ -1881,6 +2086,8 @@ All fields optional:
 
 *Cross-field/database verification*: sum of all `totalSeats` across all inventories on the flight instance must not exceed the associated aircraft's `totalCapacity`.
 
+*Service-level check (Zod cannot do this)*: if only one of (`totalSeats`, `availableSeats`) is sent, validate it against the **stored** value of the other → 422, otherwise the `chk_available_seats` DB constraint surfaces as a 500 (see Feature 4).
+
 ### HoldSeatsSchema / ReleaseSeatsSchema
 | Field | Rule |
 |---|---|
@@ -1935,6 +2142,7 @@ All fields optional:
 ```json
 {
   "inventoryId":      "inventory-uuid-999",
+  "flightInstanceId": "instance-uuid-12345",
   "airline":          "IndiGo",
   "flightNumber":     "6E-204",
   "origin":           "DEL",
@@ -1945,6 +2153,7 @@ All fields optional:
   "arrivalTime":      "09:15",
   "durationMinutes":  165,
   "cabinClass":       "ECONOMY",
+  "fareClass":        "Y",
   "basePrice":        499900,
   "availableSeats":   180,
   "totalSeats":       180,
@@ -1957,7 +2166,9 @@ All fields optional:
 }
 ```
 
-> **Normalized-to-Flat Mapping:** The Outbox Worker joins `SeatInventory`, `FlightInstance`, `FlightSchedule`, `Airport`, and `Aircraft` to produce this denormalized flat payload. `inventoryId` is `SeatInventory.id` — the Search Service uses it as the MongoDB document `_id`.
+> **Normalized-to-Flat Mapping:** The Outbox Worker joins `SeatInventory`, `FlightInstance`, `FlightSchedule`, `Airport`, and `Aircraft` to produce this denormalized flat payload. `inventoryId` is `SeatInventory.id` — the Search Service uses it as the MongoDB document key.
+
+> **Why `flightInstanceId` + `fareClass` are in the payload:** the booking handoff needs them. In Phase 4 the Booking Service must call `hold-seats` with `(instanceId, cabinClass, fareClass)` — the client can only supply those if the search result carried them. `fareClass` also disambiguates two buckets of the same cabin (ECONOMY "Y" vs ECONOMY "M"), which would otherwise render as identical-looking duplicate rows in search results.
 
 **`SEATS_HELD`** — published on successful hold:
 ```json
@@ -1993,15 +2204,18 @@ All fields optional:
 
 > **Why one event per inventory bucket?** A `FlightInstance` has multiple `SeatInventory` rows (ECONOMY/BUSINESS/FIRST). Each is a separate MongoDB document in the Search Service, keyed by `inventoryId`. One event per bucket lets the Search Service delete by `inventoryId` without complex logic.
 
+> **Consumer contract (mirrored in `03_Search_Service_Design.md` §Feature 5):** `SEATS_HELD` / `SEATS_RELEASED` handlers are **update-only — never upsert**. After `FLIGHT_CANCELLED` deletes a search document, a late or replayed `SEATS_*` event must not recreate it; only `FLIGHT_UPDATED` upserts. Field mapping: doc 03's MongoDB `flightId` field stores this payload's **`inventoryId`** (one Mongo document per seat-inventory bucket).
+
 ### 7.4 Outbox Worker Behaviour
 
 Runs every `OUTBOX_POLL_INTERVAL_MS` (default 5s):
 
-1. Queries pending events inside a short transaction using `FOR UPDATE SKIP LOCKED`, updates their status to `PROCESSING` immediately, and commits to free the database connection.
-2. For each fetched event, serializes as a standard Kafka envelope using `correlationId` from the originating HTTP request's `X-Correlation-ID` (stored in outbox payload).
-3. Uses `inventoryId` as the Kafka partition key to ensure all events for the same inventory bucket go to the same partition (guaranteeing correct event ordering).
-4. On successful publish, performs a quick transaction to update the status to `PUBLISHED` (and sets `published_at`).
-5. On failure, resets status back to `PENDING` (or marks as `FAILED` if `retry_count` exceeds limit).
+1. Reclaims stranded events: resets rows stuck in `PROCESSING` for over 2 minutes (worker crashed mid-publish) back to `PENDING` — see Feature 13 step 1. At-least-once: a reclaimed event may publish twice; consumers are idempotent by contract.
+2. Queries pending events inside a short transaction using `FOR UPDATE SKIP LOCKED`, updates their status to `PROCESSING` immediately, and commits to free the database connection.
+3. For each fetched event, serializes as a standard Kafka envelope using `correlationId` from the originating HTTP request's `X-Correlation-ID` (stored in outbox payload).
+4. Uses `inventoryId` as the Kafka partition key to ensure all events for the same inventory bucket go to the same partition (guaranteeing correct event ordering).
+5. On successful publish, performs a quick transaction to update the status to `PUBLISHED` (and sets `published_at`).
+6. On failure, resets status back to `PENDING` (or marks as `FAILED` if `retry_count` exceeds limit).
 
 ---
 
@@ -2010,19 +2224,22 @@ Runs every `OUTBOX_POLL_INTERVAL_MS` (default 5s):
 ```
 services/flight-service/
 │
-├── prisma/
-│   ├── schema.prisma              ← All models (Section 3.4)
-│   ├── migrations/
-│   │   └── 20260528_init/
-│   │       └── migration.sql      ← includes CHECK constraint SQL
-│   └── seed.ts                    ← Phase 1: airports+aircraft, Phase 2: schedules, Phase 3: instances
-│
 ├── src/
 │   │
+│   ├── db/                        ← Prisma 7 layout (schema lives inside src/)
+│   │   ├── schema.prisma          ← All models (Section 3.4)
+│   │   ├── migrations/
+│   │   │   └── <timestamp>_init/
+│   │   │       └── migration.sql  ← includes CHECK constraint SQL
+│   │   ├── generated/prisma/      ← Generated client (gitignored)
+│   │   └── seed.ts                ← Phase 1: airports+aircraft, Phase 2: schedules, Phase 3: instances
+│   │
 │   ├── config/
+│   │   ├── index.ts               ← Aggregates configs, re-exports prisma client
 │   │   ├── env.ts                 ← Zod-validated env vars — crash on startup if invalid
-│   │   ├── database.ts            ← Prisma client singleton
-│   │   ├── kafka.ts               ← KafkaJS producer (allowAutoTopicCreation: false)
+│   │   ├── prisma.config.ts       ← Prisma 7 defineConfig: schema/migrations paths + datasource URL
+│   │   ├── client.ts              ← Prisma client singleton (pg Pool + @prisma/adapter-pg)
+│   │   ├── kafka.ts               ← KafkaJS producer (Phase 3, allowAutoTopicCreation: false)
 │   │   └── logger.ts              ← Pino with AsyncLocalStorage for correlationId
 │   │
 │   ├── repositories/
@@ -2043,13 +2260,17 @@ services/flight-service/
 │   │   ├── flight.controller.ts   ← HTTP handlers for /api/v1/flights (schedules + instances + inventory)
 │   │   └── internal.controller.ts ← HTTP handlers for /internal/flights (hold/release)
 │   │
-│   ├── routes/
-│   │   ├── airport.routes.ts      ← /api/v1/airports
-│   │   ├── aircraft.routes.ts     ← /api/v1/aircrafts
-│   │   ├── flight.routes.ts       ← /api/v1/flights (schedules, instances, inventories)
-│   │   ├── internal.routes.ts     ← /internal/flights (hold-seats, release-seats)
-│   │   ├── health.routes.ts       ← GET /health
-│   │   ├── metrics.routes.ts      ← GET /metrics
+│   ├── routers/                   ← Versioned routers (implemented convention)
+│   │   ├── index.router.ts        ← mounts v1/v2 under /api → /api/v1/*, /api/v2/*
+│   │   ├── v1/
+│   │   │   ├── index.ts           ← mounts all v1 routers below
+│   │   │   ├── health.router.ts   ← GET /api/v1/health
+│   │   │   ├── airport.router.ts  ← /api/v1/airports
+│   │   │   ├── aircraft.router.ts ← /api/v1/aircrafts
+│   │   │   ├── flight.router.ts   ← /api/v1/flights (schedules, instances, inventories)
+│   │   │   └── internal.router.ts ← /internal/flights (hold/release/confirm-seats)
+│   │   ├── v2/
+│   │   │   └── index.ts           ← placeholder for future breaking changes
 │   │   └── schemas/
 │   │       └── flight.schemas.ts  ← All Zod schemas (Section 6)
 │   │
@@ -2116,16 +2337,15 @@ Outbox Worker  → runs independently, reads outbox → publishes Kafka → upda
 
 **`requireRole.ts`** reads `X-User-Id` and `X-User-Role` headers (injected by Gateway), validates presence, and checks the role. Attaches `req.userId` and `req.userRole`. `X-User-Id` is stored as `createdById` on new schedules and instances.
 
-**Route mounting in `app.ts`:**
+**Route mounting (implemented convention — versioned routers):**
 ```typescript
-app.use('/api/v1/airports',  airportRouter)
-app.use('/api/v1/aircrafts', aircraftRouter)
-app.use('/api/v1/flights',   flightRouter)
+// server.ts
+app.use('/api', indexRouter)                 // index.router.ts → /api/v1/*, /api/v2/*
 app.use('/internal/flights', internalAuth, internalRouter)
-app.use('/',                 healthRouter)
-app.use('/',                 metricsRouter)
-app.use(globalErrorHandler)   // must be last
+app.use(notFoundHandler)                     // after routes
+app.use(globalErrorHandler)                  // must be last (4-arg)
 ```
+Inside `routers/v1/index.ts`, each resource router is mounted on its path (`/health`, `/airports`, `/aircrafts`, `/flights`), so all public endpoints resolve under `/api/v1/...`.
 
 ---
 
@@ -2143,23 +2363,27 @@ app.use(globalErrorHandler)   // must be last
     "dev":          "tsx watch src/server.ts",
     "build":        "tsup src/server.ts --format esm --clean --minify",
     "start":        "node dist/server.js",
-    "migrate":      "prisma migrate deploy",
-    "migrate:dev":  "prisma migrate dev",
-    "seed":         "tsx prisma/seed.ts",
+    "db:migrate":   "prisma migrate dev --config src/config/prisma.config.ts",
+    "db:deploy":    "prisma migrate deploy --config src/config/prisma.config.ts",
+    "db:generate":  "prisma generate --config src/config/prisma.config.ts",
+    "db:studio":    "prisma studio --config src/config/prisma.config.ts",
+    "seed":         "tsx src/db/seed.ts",
     "lint":         "eslint .",
     "test":         "vitest",
     "test:coverage":"vitest run --coverage",
     "typecheck":    "tsc --noEmit"
   },
   "dependencies": {
-    "@prisma/client":       "^5.14.0",
+    "@prisma/adapter-pg":   "^7.8.0",
+    "@prisma/client":       "^7.8.0",
     "@skyhub/common-utils": "*",
     "@skyhub/shared-types": "*",
     "cors":                 "^2.8.5",
-    "dotenv":               "^16.4.5",
+    "dotenv":               "^17.4.2",
     "express":              "^5.2.1",
     "helmet":               "^7.1.0",
     "kafkajs":              "^2.2.4",
+    "pg":                   "^8.21.0",
     "pino":                 "^9.2.0",
     "pino-http":            "^10.2.0",
     "prom-client":          "^15.1.2",
@@ -2170,10 +2394,11 @@ app.use(globalErrorHandler)   // must be last
     "@types/cors":          "^2.8.17",
     "@types/express":       "^5.0.6",
     "@types/node":          "^22.0.0",
+    "@types/pg":            "^8.20.0",
     "@types/supertest":     "^6.0.2",
     "@vitest/coverage-v8":  "^1.6.0",
     "pino-pretty":          "^11.0.0",
-    "prisma":               "^5.14.0",
+    "prisma":               "^7.8.0",
     "supertest":            "^6.3.4",
     "tsup":                 "^8.4.0",
     "tsx":                  "^4.15.7",
@@ -2186,7 +2411,8 @@ app.use(globalErrorHandler)   // must be last
 
 | Package | Why |
 |---|---|
-| `@prisma/client` | Type-safe PostgreSQL ORM. For `SELECT...FOR UPDATE`, use `prisma.$queryRaw` with tagged template literals (also parameterized — prevents SQL injection). |
+| `@prisma/client` | Type-safe PostgreSQL ORM (v7). For `SELECT...FOR UPDATE`, use `prisma.$queryRaw` with tagged template literals (also parameterized — prevents SQL injection). |
+| `@prisma/adapter-pg` + `pg` | Prisma 7 driver adapter — the client is constructed over an explicit `pg.Pool` (`new PrismaClient({ adapter })`), giving direct control of pool size/timeouts. |
 | `kafkajs` | Producer only — publishes `flight-inventory-events`. No consumer in this service. |
 | `prom-client` | Exposes `/metrics`. Custom counter for `flight_hold_requests_total{result}` and gauge for `outbox_pending_count`. |
 | `uuid` | Generates `eventId` for Kafka message envelopes. |
@@ -2260,7 +2486,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318/v1/traces
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": { "outDir": "./dist", "rootDir": "./src" },
-  "include": ["src/**/*", "prisma/seed.ts"],
+  "include": ["src/**/*"],
   "references": [
     { "path": "../../packages/shared-types" },
     { "path": "../../packages/common-utils" }
@@ -2279,8 +2505,8 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318/v1/traces
 
 1. Ensure Postgres is running: `docker compose up -d`
 2. Verify `skyhub_flight_db` database exists
-3. Copy schema from Section 3.4
-4. Run: `npx prisma migrate dev --name init`
+3. Copy schema from Section 3.4 into `src/db/schema.prisma` (datasource URL lives in `src/config/prisma.config.ts`, not the schema)
+4. Run: `npm run db:migrate -- --name init` (wraps `prisma migrate dev --config src/config/prisma.config.ts`)
 5. Manually add CHECK constraints from Section 3.3 to the generated `migration.sql`.
 6. Optimize the outbox database index in `migration.sql` by replacing the default compound status index with a high-performance partial index:
    ```sql
@@ -2288,7 +2514,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318/v1/traces
    CREATE INDEX idx_pending_outbox ON outbox_events (created_at) WHERE status = 'PENDING';
    ```
 
-**Seed file (`prisma/seed.ts`) — three phases in strict order (FK constraints require this):**
+**Seed file (`src/db/seed.ts`) — three phases in strict order (FK constraints require this):**
 
 **Phase 1 — Reference data (airports + aircraft must exist before schedules):**
 ```typescript
@@ -2353,7 +2579,7 @@ await prisma.flightInstance.create({
 
 ### Step 3: Utilities & Common Infrastructure
 
-1. `src/config/database.ts` — Prisma client singleton
+1. `src/config/client.ts` — Prisma client singleton (pg Pool + `@prisma/adapter-pg`) — *already implemented*
 2. `src/config/kafka.ts` — KafkaJS producer with `allowAutoTopicCreation: false`
 3. `src/config/logger.ts` — Pino with AsyncLocalStorage
 4. `src/utils/response.utils.ts` — `sendSuccess()`, `sendError()`
@@ -2367,7 +2593,7 @@ export function requireRole(...allowedRoles: string[]): RequestHandler
 ```
 7. `src/middlewares/validate.ts`, `validateQuery.ts`, `validateParams.ts`
 8. `src/middlewares/errorHandler.ts` — global error handler
-9. `src/routes/schemas/flight.schemas.ts` from Section 6
+9. `src/routers/schemas/flight.schemas.ts` from Section 6
 
 ---
 

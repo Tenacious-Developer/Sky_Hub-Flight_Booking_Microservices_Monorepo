@@ -17,6 +17,19 @@
 
 ---
 
+## ⚠️ Build Scope — Read Before Building Anything
+
+Built in **Phase 3** of [`00_Build_Roadmap.md`](00_Build_Roadmap.md) — this is the phase where Kafka goes live (the outbox *worker* in Flight Service is built now too; the outbox rows have been accumulating since Phase 1).
+
+| Stage | Features |
+|---|---|
+| **v1 — Phase 3** | Kafka consumer → MongoDB read model (Features 5–6), cache-aside Redis with tag invalidation (Features 1, 3), loyalty discount via shared pricing function (Feature 4), single flight detail (Feature 2), health check. |
+| **Deferred** | `/metrics` (Phase 8), personalized ranking from `userTiers` (Phase 7 idea), signed fare quotes (Phase 7 — see below). |
+
+**Redis instance note:** this service connects to **`redis-cache` (port 6380, `allkeys-lru`)** — never to `redis-core`. See `01_Architecture.md` §7.
+
+---
+
 ## 1. Bounded Context & Responsibility
 
 The Search Service is the **CQRS read model** for the entire SkyHub cluster. It never writes to the Flight Service's database — it builds and maintains its own read-optimized MongoDB copy of the flight catalog, updated exclusively via Kafka events published by the Flight Service.
@@ -75,7 +88,7 @@ CLIENT
 |---|---|
 | `skyhub_search_db` (MongoDB, exclusive) | `skyhub_flight_db` (PostgreSQL — Flight Service owns it) |
 | Read-optimized flight documents | Seat inventory write operations |
-| Redis cache DB 1 (search cache) | Redis DB 0 (Gateway + User Service blacklist) |
+| `redis-cache` :6380 (search cache + invalidation tags) | `redis-core` :6379 (rate limits, JWT blacklist, BullMQ — never touched) |
 | Loyalty discount calculation | Loyalty tier assignment (User Service owns it) |
 | Tag-based cache invalidation | Flight creation / modification |
 | Kafka consumer for flight + user events | Any write to any other service's database |
@@ -94,7 +107,7 @@ The primary search query is a multi-field filter on `origin`, `destination`, `de
 1. Client sends `GET /api/v1/search?from=DEL&to=BOM&date=2026-10-12&passengers=2&cabin=ECONOMY`
 2. Zod validates all query params — rejects malformed IATA codes, invalid dates, out-of-range passengers
 3. Build canonical cache key: `search:{origin}:{destination}:{date}:{passengers}:{cabin}` (all uppercase)
-4. Check Redis DB 1 for this key
+4. Check `redis-cache` (:6380) for this key
 5. **Cache HIT (< 150ms SLO):**
    - Deserialize JSON from Redis
    - Apply loyalty discount from `X-User-Loyalty-Tier` header in memory
@@ -103,6 +116,7 @@ The primary search query is a multi-field filter on `origin`, `destination`, `de
    - Paginate in memory
    - Return result
 6. **Cache MISS (< 800ms SLO):**
+   - Acquire the single-flight rebuild lock — on a hot key, N concurrent misses must produce ~1 MongoDB query, not N (see §4.4)
    - Query MongoDB with compound-indexed filter
    - Apply `availableSeats >= passengers` filter at DB level
    - Store raw flight list in Redis: `SET key <json> EX 300` (5-minute TTL)
@@ -132,8 +146,8 @@ The Search Service's MongoDB read model already has all display fields needed �
 
 **Triggered by Kafka consumer — not an HTTP endpoint:**
 
-When a `FLIGHT_UPDATED`, `SEATS_HELD`, or `SEATS_RELEASED` event arrives from Kafka:
-1. Upsert the flight document in MongoDB
+When a `FLIGHT_UPDATED`, `SEATS_HELD`, `SEATS_RELEASED`, or `FLIGHT_CANCELLED` event arrives from Kafka:
+1. Apply the document change in MongoDB (upsert / seat update / delete — see Feature 5)
 2. Look up all cache keys that reference this flight: `SMEMBERS "tag:flight:{flightId}"`
 3. Delete all affected cache keys in one batch: `DEL key1 key2 key3 ...`
 4. Delete the tag set itself: `DEL "tag:flight:{flightId}"`
@@ -168,6 +182,8 @@ Integer arithmetic on minor units eliminates floating-point rounding errors. `Ma
 Primary: `X-User-Loyalty-Tier` header injected by the API Gateway from the verified JWT.
 Fallback: If header is absent or invalid, default to `SILVER` (unauthenticated users get the base discount).
 
+> 🔒 **CRITICAL — this calculation must NOT live in this service.** The discount function is `calculateFinalPrice(basePriceMinorUnits, loyaltyTier)` in **`@skyhub/common-utils`**, and the Booking Service calls the *same function* with the *same inputs* to compute the actual charge. If Search implemented its own copy, the displayed price and the charged price would inevitably drift — the classic "quoted ₹4,499, charged ₹4,999" bug. One pure function, two callers, zero drift. (Phase 7 upgrade: signed fare quotes — Search returns an HMAC-signed `{flightId, finalPrice, tier, expiresAt}` token that Booking validates, protecting the user even if the *base price* changes between search and booking. See `01_Architecture.md` §1.)
+
 ---
 
 ### Feature 5: Kafka Consumer — Flight Inventory Events
@@ -179,10 +195,15 @@ Events consumed:
 | Event Type | Action |
 |---|---|
 | `FLIGHT_UPDATED` | Upsert full flight document in MongoDB. Invalidate all cache entries tagged with this `flightId`. |
-| `SEATS_HELD` | Update `availableSeats` field in MongoDB (decrement). Invalidate cache entries for this flight. |
-| `SEATS_RELEASED` | Update `availableSeats` field in MongoDB (increment). Invalidate cache entries for this flight. |
+| `SEATS_HELD` | **SET** `availableSeats` to the `remainingSeats` value carried in the event payload — **update-only, never upsert**. Invalidate cache entries for this flight. |
+| `SEATS_RELEASED` | **SET** `availableSeats` to the `remainingSeats` value carried in the event payload — **update-only, never upsert**. Invalidate cache entries for this flight. |
+| `FLIGHT_CANCELLED` | **DELETE** the flight document (Flight Service publishes one event per inventory bucket, so each delete targets exactly one document). Invalidate cache entries for this flight. Deleting an already-deleted document is a no-op — idempotent. |
 
-**Consumer idempotency:** The upsert (`findOneAndUpdate` with `upsert: true`) is naturally idempotent — replaying the same event produces the same document. The cache invalidation is also idempotent — deleting already-deleted keys is a no-op in Redis.
+> **Field mapping:** the MongoDB `flightId` field stores the event payload's **`inventoryId`** (`SeatInventory.id` in the Flight Service) — one Mongo document per seat-inventory bucket, not per flight instance. See `04_Flight_Service_Design.md` §7.3.
+
+> **Why `SEATS_*` must be update-only:** after `FLIGHT_CANCELLED` deletes a document, a late or replayed `SEATS_HELD`/`SEATS_RELEASED` event for the same bucket must NOT recreate it. An upsert here would resurrect a cancelled flight in search results with only a seat count and no display fields. Only `FLIGHT_UPDATED` (which carries the full document) is allowed to upsert.
+
+**Consumer idempotency — why SET, never increment/decrement:** Kafka + outbox is at-least-once delivery, so every handler must tolerate replays. `$set: { availableSeats: event.payload.remainingSeats }` replayed twice produces identical state. A `$inc: -2` replayed twice **double-decrements — a silent data corruption bug**. This is why the Flight Service includes the absolute `remainingSeats` in every seat event instead of a delta, and why Kafka messages are keyed by `flightId` (same partition → ordered delivery → the latest SET always wins). The `FLIGHT_UPDATED` upsert (`findOneAndUpdate` with `upsert: true`) is idempotent for the same reason, and cache invalidation is trivially idempotent — deleting already-deleted keys is a no-op in Redis.
 
 ---
 
@@ -204,7 +225,7 @@ The primary discount source is the `X-User-Loyalty-Tier` JWT header. The `userTi
 
 ### Feature 7: Health Check
 
-**`GET /health` — public, no auth:**
+**`GET /api/v1/health` — public, no auth (versioned path — cluster convention, same as Flight Service):**
 
 Checks MongoDB connection, Redis connection, and Kafka consumer health. Returns `200` if all pass, `503` if any fail.
 
@@ -241,7 +262,8 @@ The Search Service uses two MongoDB collections:
 │                        flights                              │
 ├─────────────────────────────────────────────────────────────┤
 │ _id             ObjectId    PK (auto-generated by MongoDB)  │
-│ flightId        String      UNIQUE — mirrors Flight Service │
+│ flightId        String      UNIQUE — event payload's inventoryId │
+│ flightInstanceId String     parent instance — booking handoff │
 │ airline         String      e.g., "IndiGo", "Air India"    │
 │ flightNumber    String      e.g., "6E-204"                 │
 │ origin          String      IATA code: "DEL"               │
@@ -252,6 +274,7 @@ The Search Service uses two MongoDB collections:
 │ arrivalTime     String      "09:15"                        │
 │ durationMinutes Number      165 (pre-computed for sort)    │
 │ cabinClass      String      "ECONOMY" | "BUSINESS" | "FIRST"│
+│ fareClass       String      "Y", "M" — disambiguates buckets│
 │ basePrice       Number      499900 (paise — minor units)   │
 │ availableSeats  Number      142                            │
 │ totalSeats      Number      180                            │
@@ -260,6 +283,7 @@ The Search Service uses two MongoDB collections:
 │ amenities       String[]    ["wifi", "meal", "usb"]        │
 │ baggageAllowance Object     { cabin: "7kg", checked: "15kg"}│
 │ refundable      Boolean     true                           │
+│ status          String      "SCHEDULED"|"DELAYED"|"BOARDING"|"DEPARTED" │
 │ updatedAt       Date        set on every Kafka upsert      │
 └─────────────────────────────────────────────────────────────┘
 
@@ -279,13 +303,16 @@ The Search Service uses two MongoDB collections:
 
 | Field | Type | Why This Design |
 |---|---|---|
-| `flightId` | String (unique index) | Maps back to the Flight Service PostgreSQL UUID. All Kafka events carry this ID. Unique index enables O(1) upsert lookup. |
+| `flightId` | String (unique index) | Stores the event payload's **`inventoryId`** (`SeatInventory.id` in Flight Service) — one document per seat-inventory bucket. Unique index enables O(1) upsert lookup. |
+| `flightInstanceId` | String | Parent `FlightInstance` UUID. **The booking handoff:** the client passes this (with `cabinClass` + `fareClass`) to the Booking Service, which needs all three for the `hold-seats` call (doc 04 Feature 8). |
+| `fareClass` | String | Booking code ("Y", "M", …). Disambiguates two buckets of the same cabin (ECONOMY-Y vs ECONOMY-M look identical without it) and is required by `hold-seats`. |
 | `departureDate` | String "YYYY-MM-DD" | Stored as a string, not a Date, so the compound index uses exact equality (`$eq`) — faster than a range query on DateTime. The search query always asks for a specific date, not a date range. |
 | `departureTime` | String "HH:MM" | Display field. Also used for sorting by departure time — lexicographic sort on "HH:MM" strings works correctly within a single day. |
 | `durationMinutes` | Number | Pre-computed at upsert time from departure and arrival. Avoids recomputing on every search for sort-by-duration. |
 | `basePrice` | Number (integer) | Minor units (paise for INR, cents for USD). Never floats. Discount calculation: `Math.round(basePrice * multiplier)`. |
 | `availableSeats` | Number | Updated on every `SEATS_HELD` and `SEATS_RELEASED` Kafka event. The search query filters `availableSeats >= passengers`. |
 | `stops` | Number | 0 = direct. Used for `directOnly` filter. Stored as a number so future support for multi-stop can express stop count. |
+| `status` | String | Operational status from `FLIGHT_UPDATED` events (doc 04 Feature 3 publishes status changes precisely so Search can sync them). The search query filters `status ∈ {SCHEDULED, DELAYED}` — BOARDING/DEPARTED flights are no longer bookable and drop out of results; CANCELLED flights never appear (their documents are deleted by `FLIGHT_CANCELLED`). |
 | `updatedAt` | Date | Set on every Kafka-triggered upsert. Useful for debugging staleness: "when was this document last updated from Kafka?" |
 
 #### `user_tiers` collection
@@ -303,7 +330,8 @@ The Search Service uses two MongoDB collections:
 import mongoose, { Schema, Document, Model } from 'mongoose';
 
 export interface IFlight extends Document {
-  flightId:        string;
+  flightId:         string;   // = event payload's inventoryId
+  flightInstanceId: string;   // parent instance — booking handoff
   airline:         string;
   flightNumber:    string;
   origin:          string;
@@ -314,6 +342,7 @@ export interface IFlight extends Document {
   arrivalTime:     string;
   durationMinutes: number;
   cabinClass:      'ECONOMY' | 'BUSINESS' | 'FIRST';
+  fareClass:       string;    // "Y", "M" — disambiguates buckets, required by hold-seats
   basePrice:       number;
   availableSeats:  number;
   totalSeats:      number;
@@ -325,12 +354,14 @@ export interface IFlight extends Document {
     checked: string;
   };
   refundable: boolean;
+  status:     'SCHEDULED' | 'BOARDING' | 'DEPARTED' | 'DELAYED';
   updatedAt:  Date;
 }
 
 const flightSchema = new Schema<IFlight>(
   {
-    flightId:        { type: String, required: true, unique: true },
+    flightId:         { type: String, required: true, unique: true },
+    flightInstanceId: { type: String, required: true },
     airline:         { type: String, required: true },
     flightNumber:    { type: String, required: true },
     origin:          { type: String, required: true, uppercase: true },
@@ -341,6 +372,7 @@ const flightSchema = new Schema<IFlight>(
     arrivalTime:     { type: String, required: true },
     durationMinutes: { type: Number, required: true },
     cabinClass:      { type: String, required: true, enum: ['ECONOMY', 'BUSINESS', 'FIRST'] },
+    fareClass:       { type: String, required: true },
     basePrice:       { type: Number, required: true },   // paise
     availableSeats:  { type: Number, required: true, min: 0 },
     totalSeats:      { type: Number, required: true },
@@ -352,6 +384,10 @@ const flightSchema = new Schema<IFlight>(
       checked: { type: String, default: '15kg' },
     },
     refundable: { type: Boolean, default: false },
+    // Without this field, Mongoose strict mode silently DROPS the `status` that
+    // FLIGHT_UPDATED events carry (doc 04 §7.3) — and DEPARTED flights would stay searchable.
+    status:     { type: String, required: true, default: 'SCHEDULED',
+                  enum: ['SCHEDULED', 'BOARDING', 'DEPARTED', 'DELAYED'] },
   },
   {
     timestamps: true,      // adds createdAt + updatedAt automatically
@@ -372,11 +408,12 @@ flightSchema.index(
 // Already covered by the unique index defined in the schema field above.
 // Mongoose creates a unique index automatically for { unique: true } fields.
 
-// Price range filter (optional query param: maxPrice)
-flightSchema.index({ basePrice: 1 }, { name: 'idx_price' });
-
-// Sort by available seats (e.g., "most available first")
-flightSchema.index({ availableSeats: 1 }, { name: 'idx_available_seats' });
+// NOTE (v1): maxPrice and sorting are applied IN MEMORY after the cache/compound-index
+// fetch (Feature 1) — standalone basePrice/availableSeats indexes would never be used
+// by v1 queries, yet every index slows down the hot Kafka upsert path. Deferred.
+// (If a DB-level filter is ever needed, append the field to the compound index instead.)
+// flightSchema.index({ basePrice: 1 },      { name: 'idx_price' });
+// flightSchema.index({ availableSeats: 1 }, { name: 'idx_available_seats' });
 
 export const FlightModel: Model<IFlight> = mongoose.model<IFlight>('Flight', flightSchema);
 ```
@@ -412,8 +449,8 @@ export const UserTierModel: Model<IUserTier> = mongoose.model<IUserTier>('UserTi
 |---|---|---|---|
 | `flights` | `{ flightId: 1 }` | Unique B-Tree | Kafka upsert lookup, single flight detail |
 | `flights` | `{ origin, destination, departureDate, cabinClass }` | Compound B-Tree | Primary search query |
-| `flights` | `{ basePrice: 1 }` | B-Tree | Optional price-range pre-filter |
-| `flights` | `{ availableSeats: 1 }` | B-Tree | Available seats filter |
+| `flights` | `{ basePrice: 1 }` | B-Tree | **Deferred — not created in v1.** maxPrice filters run in memory (Feature 1); an unused index only taxes the Kafka upsert path. |
+| `flights` | `{ availableSeats: 1 }` | B-Tree | **Deferred — not created in v1.** The `$gte` rides on the compound-index result set. |
 | `user_tiers` | `{ userId: 1 }` | Unique B-Tree | User tier lookup by userId |
 
 **Why the compound index key order matters:**
@@ -432,7 +469,9 @@ MongoDB uses an index for a query only if the leftmost fields of the index are p
 Key format:   search:{ORIGIN}:{DESTINATION}:{DATE}:{PASSENGERS}:{CABIN}
 Example:      search:DEL:BOM:2026-10-12:2:ECONOMY
 TTL:          300 seconds (5 minutes)
-Redis DB:     1 (Search Service exclusive — never share with Gateway DB 0)
+Redis:        redis-cache instance (:6380, allkeys-lru), DB 0 — physically separate
+              from redis-core (:6379). Isolation is per-INSTANCE, not per-logical-DB,
+              because maxmemory-policy is per-instance (00_Build_Roadmap.md §8).
 ```
 
 **Why include `passengers` in the cache key?**
@@ -534,6 +573,38 @@ async function getOrSet<T>(
 **Why `pipeline.exec()`?**
 Pipelining sends all Redis commands in a single network round trip. For 20 flights in a result, we send 40 commands (20 SADD + 20 EXPIRE) in one trip instead of 40 individual TCP calls.
 
+### 4.4 Cache Stampede Mitigation (Single-Flight Lock)
+
+**The problem:** the moment a popular route's cache entry is invalidated (a `SEATS_HELD` event on DEL→BOM during peak hours), every concurrent request for that search misses simultaneously — N identical MongoDB queries fire at once instead of one. This is the *stampede* (a.k.a. dog-piling), and tag-based invalidation makes it more likely because invalidation is instant.
+
+**v1 mitigation — short single-flight lock around the rebuild:**
+
+```typescript
+// Inside the cache-miss branch of getOrSet():
+const lockKey = `lock:${key}`;
+const gotLock = await redis.set(lockKey, '1', 'EX', 5, 'NX');  // one winner, 5s safety TTL
+
+if (!gotLock) {
+  // Another request is already rebuilding this entry.
+  // Wait briefly, then re-read the cache ONCE — never spin or block a user for long.
+  await new Promise((r) => setTimeout(r, 100));
+  const retry = await redis.get(key);
+  if (retry) return JSON.parse(retry);
+  // Still not there (rebuilder is slow) — fall through and query MongoDB anyway.
+  // Worst case a few requests duplicate the query; correctness is unaffected.
+}
+
+try {
+  const results = await fetcher();                  // the MongoDB query
+  await cacheService.set(key, results, flightIds);  // SET + tags
+  return results;
+} finally {
+  await redis.del(lockKey);                         // release early; EX 5 is the crash backstop
+}
+```
+
+**Why this shape:** the lock converts N concurrent misses into ~1 MongoDB query + (N−1) cheap 100ms-delayed cache reads. The `EX 5` TTL guarantees a crashed rebuilder can never deadlock the key, and the fall-through path guarantees no user ever *waits* on a lock — duplicated queries are the graceful degradation, not errors.
+
 ---
 
 ## 5. Complete REST API Specification
@@ -554,11 +625,12 @@ Same as the rest of the cluster:
   traceId: string
 }
 
-// Error
+// Error (statusCode + name — matches the common-utils globalErrorHandler)
 {
   success: false,
   error: {
-    code: string,
+    statusCode: number,    // e.g. 400, 404
+    name: string,          // machine-readable code, e.g. 'VALIDATION_ERROR', 'NOT_FOUND'
     message: string,
     details?: Array<{ field: string, message: string }>
   },
@@ -606,7 +678,8 @@ X-User-Loyalty-Tier: GOLD                          (injected by Gateway from JWT
   "data": {
     "flights": [
       {
-        "flightId":        "abc123-def456-ghi789",
+        "flightId":         "abc123-def456-ghi789",
+        "flightInstanceId": "instance-uuid-12345",
         "airline":         "IndiGo",
         "flightNumber":    "6E-204",
         "origin":          "DEL",
@@ -617,6 +690,7 @@ X-User-Loyalty-Tier: GOLD                          (injected by Gateway from JWT
         "arrivalTime":     "09:15",
         "durationMinutes": 165,
         "cabinClass":      "ECONOMY",
+        "fareClass":       "Y",
         "basePrice":       499900,
         "discountedPrice": 449910,
         "discountPercent": 10,
@@ -662,17 +736,19 @@ X-User-Loyalty-Tier: GOLD                          (injected by Gateway from JWT
 **Error Responses:**
 ```
 400 VALIDATION_ERROR    → missing required params, invalid date format, invalid IATA code
-404 NOT_FOUND           → no flights match the criteria
 500 INTERNAL_ERROR      → unexpected server error
 503 SERVICE_UNAVAILABLE → MongoDB or Redis unavailable
 ```
+
+> **No 404 for empty results:** zero matching flights is a *successful* search — the response is `200` with `flights: []` and `meta.total: 0`. (404 stays reserved for Endpoint 2, where a specific resource is addressed by ID.)
 
 **400 Validation Error Example:**
 ```json
 {
   "success": false,
   "error": {
-    "code": "VALIDATION_ERROR",
+    "statusCode": 400,
+    "name": "VALIDATION_ERROR",
     "message": "Request validation failed",
     "details": [
       { "field": "from", "message": "Origin must be a 3-letter IATA code" },
@@ -705,7 +781,8 @@ X-Correlation-ID: tr-f47ac10b
   "success": true,
   "message": "Flight retrieved successfully.",
   "data": {
-    "flightId":        "abc123-def456-ghi789",
+    "flightId":         "abc123-def456-ghi789",
+    "flightInstanceId": "instance-uuid-12345",
     "airline":         "IndiGo",
     "flightNumber":    "6E-204",
     "origin":          "DEL",
@@ -716,6 +793,7 @@ X-Correlation-ID: tr-f47ac10b
     "arrivalTime":     "09:15",
     "durationMinutes": 165,
     "cabinClass":      "ECONOMY",
+    "fareClass":       "Y",
     "basePrice":       499900,
     "discountedPrice": 424915,
     "discountPercent": 15,
@@ -743,7 +821,7 @@ X-Correlation-ID: tr-f47ac10b
 
 ---
 
-### Endpoint 3: GET /health
+### Endpoint 3: GET /api/v1/health
 
 **Auth required:** No
 
@@ -770,7 +848,7 @@ X-Correlation-ID: tr-f47ac10b
   "timestamp": "2026-05-28T10:00:00.000Z",
   "checks": {
     "mongodb": "ok",
-    "redis":   "error: ECONNREFUSED 127.0.0.1:6379",
+    "redis":   "error: ECONNREFUSED 127.0.0.1:6380",
     "kafka":   "ok"
   }
 }
@@ -933,6 +1011,14 @@ export const consumer: Consumer = kafka.consumer({
   groupId: env.KAFKA_GROUP_ID,  // 'search-service-group'
 });
 
+// Real health flag for /health — kafkajs exposes no public status field.
+// (Never poke (consumer as any)._status — private internals change between versions.)
+let consumerHealthy = false;
+consumer.on(consumer.events.GROUP_JOIN, () => { consumerHealthy = true;  });
+consumer.on(consumer.events.CRASH,      () => { consumerHealthy = false; });
+consumer.on(consumer.events.DISCONNECT, () => { consumerHealthy = false; });
+export const isConsumerHealthy = () => consumerHealthy;
+
 export async function startKafkaConsumers(): Promise<void> {
   await consumer.connect();
 
@@ -947,17 +1033,27 @@ export async function startKafkaConsumers(): Promise<void> {
       const raw = message.value?.toString();
       if (!raw) return;
 
+      // POISON vs TRANSIENT — two different policies:
+      let event;
       try {
-        const event = JSON.parse(raw);
-        if (topic === env.KAFKA_TOPIC_FLIGHT_EVENTS) {
-          await handleFlightEvent(event);
-        } else if (topic === env.KAFKA_TOPIC_USER_EVENTS) {
-          await handleUserEvent(event);
-        }
+        event = JSON.parse(raw);
       } catch (err) {
-        logger.error({ err, topic, offset: message.offset }, 'Failed to process Kafka message');
-        // Do NOT throw — throwing here causes the consumer to crash.
-        // Log and continue. A future improvement: send to DLQ.
+        // Poison message: malformed JSON will never parse, no matter how often
+        // it is retried. Log + skip (future improvement: route to a DLQ topic).
+        logger.error({ err, topic, offset: message.offset }, 'Unparseable Kafka message — skipped');
+        return;
+      }
+
+      // Handler errors are deliberately NOT caught here: if the handler throws
+      // (e.g. MongoDB briefly down), kafkajs does NOT commit the offset and
+      // redelivers the message. Swallowing the error would commit past a failed
+      // event — a lost FLIGHT_UPDATED means a permanently stale document until
+      // the next update for that flight. Redelivery is safe because every
+      // handler is idempotent (upserts / absolute $set / idempotent delete).
+      if (topic === env.KAFKA_TOPIC_FLIGHT_EVENTS) {
+        await handleFlightEvent(event);
+      } else if (topic === env.KAFKA_TOPIC_USER_EVENTS) {
+        await handleUserEvent(event);
       }
     },
   });
@@ -973,8 +1069,12 @@ import { FlightModel } from '../../models/flight.model.js';
 import { cacheService } from '../../services/cache.service.js';
 import { logger } from '../../config/logger.js';
 
+// Payload shapes match doc 04 §7.3 — note the key is `inventoryId` (one event per
+// seat-inventory bucket). The Mongo document stores it under the `flightId` field.
 interface FlightUpdatedPayload {
-  flightId:        string;
+  inventoryId:      string;
+  flightInstanceId: string;
+  fareClass:        string;
   airline:         string;
   flightNumber:    string;
   origin:          string;
@@ -993,10 +1093,11 @@ interface FlightUpdatedPayload {
   amenities?:      string[];
   baggageAllowance?: { cabin: string; checked: string };
   refundable?:     boolean;
+  status?:         'SCHEDULED' | 'BOARDING' | 'DEPARTED' | 'DELAYED';
 }
 
 interface SeatsChangedPayload {
-  flightId:       string;
+  inventoryId:    string;
   remainingSeats: number;
 }
 
@@ -1009,14 +1110,16 @@ export async function handleFlightEvent(event: {
   switch (eventType) {
     case 'FLIGHT_UPDATED': {
       const p = payload as FlightUpdatedPayload;
+      // Map payload key → document key: events carry `inventoryId`, Mongo stores `flightId`
+      const { inventoryId, ...doc } = p;
       // Upsert: create if not exists, update if exists — naturally idempotent
       await FlightModel.findOneAndUpdate(
-        { flightId: p.flightId },
-        { $set: { ...p, updatedAt: new Date() } },
+        { flightId: inventoryId },
+        { $set: { ...doc, flightId: inventoryId, updatedAt: new Date() } },
         { upsert: true, new: true, runValidators: true }
       );
-      await cacheService.invalidateFlightCache(p.flightId);
-      logger.info({ flightId: p.flightId }, 'Flight upserted and cache invalidated');
+      await cacheService.invalidateFlightCache(inventoryId);
+      logger.info({ flightId: inventoryId }, 'Flight upserted and cache invalidated');
       break;
     }
 
@@ -1025,12 +1128,24 @@ export async function handleFlightEvent(event: {
       const p = payload as SeatsChangedPayload;
       // Set exact value (not increment/decrement) — idempotent
       // The payload carries the authoritative remaining seat count from Flight Service
+      // UPDATE-ONLY (no upsert option): a late SEATS_* event arriving after
+      // FLIGHT_CANCELLED deleted this document must never resurrect it
       await FlightModel.findOneAndUpdate(
-        { flightId: p.flightId },
+        { flightId: p.inventoryId },
         { $set: { availableSeats: p.remainingSeats, updatedAt: new Date() } }
       );
-      await cacheService.invalidateFlightCache(p.flightId);
-      logger.info({ flightId: p.flightId, eventType, remainingSeats: p.remainingSeats }, 'Seat count updated');
+      await cacheService.invalidateFlightCache(p.inventoryId);
+      logger.info({ flightId: p.inventoryId, eventType, remainingSeats: p.remainingSeats }, 'Seat count updated');
+      break;
+    }
+
+    case 'FLIGHT_CANCELLED': {
+      const p = payload as { inventoryId: string };
+      // One FLIGHT_CANCELLED event per inventory bucket → one document each.
+      // deleteOne on a missing document is a no-op — idempotent on replay.
+      await FlightModel.deleteOne({ flightId: p.inventoryId });
+      await cacheService.invalidateFlightCache(p.inventoryId);
+      logger.info({ flightId: p.inventoryId }, 'Cancelled flight removed from read model');
       break;
     }
 
@@ -1098,7 +1213,7 @@ services/search-service/
 │   ├── config/
 │   │   ├── env.ts              ← Zod-validated env vars — crashes on startup if invalid
 │   │   ├── database.ts         ← Mongoose connection singleton
-│   │   ├── redis.ts            ← ioredis client singleton (DB 1)
+│   │   ├── redis.ts            ← ioredis client singleton (redis-cache :6380)
 │   │   ├── kafka.ts            ← KafkaJS consumer factory
 │   │   └── logger.ts           ← Pino with AsyncLocalStorage correlation injection
 │   │
@@ -1128,7 +1243,7 @@ services/search-service/
 │   ├── middlewares/
 │   │   ├── validateQuery.ts       ← Zod validation for req.query (GET requests)
 │   │   ├── validateParams.ts      ← Zod validation for req.params (path params)
-│   │   └── errorHandler.ts        ← Global Express error handler
+│   │   └── errorHandler.ts        ← Re-exports globalErrorHandler + notFoundHandler from common-utils
 │   │
 │   ├── events/
 │   │   └── consumers/
@@ -1180,12 +1295,19 @@ Events      → Kafka consumers call Repositories + CacheService directly
 ```typescript
 import type { SearchQueryInput } from '../routes/schemas/search.schemas.js';
 
-declare namespace Express {
-  interface Request {
-    validatedQuery?: SearchQueryInput;   // set by validateQuery middleware
-    validatedParams?: Record<string, string>; // set by validateParams middleware
+// The import above makes this file a MODULE — a bare `declare namespace Express`
+// would no longer merge into the global Express types. It must be wrapped in
+// `declare global` for the augmentation to apply.
+declare global {
+  namespace Express {
+    interface Request {
+      validatedQuery?: SearchQueryInput;        // set by validateQuery middleware
+      validatedParams?: Record<string, string>; // set by validateParams middleware
+    }
   }
 }
+
+export {};
 ```
 
 **`src/middlewares/validateQuery.ts`:**
@@ -1203,7 +1325,7 @@ export function validateQuery(schema: ZodSchema) {
         message: e.message,
       }));
       return sendError({
-        res, statusCode: 400, code: 'VALIDATION_ERROR',
+        res, statusCode: 400, name: 'VALIDATION_ERROR',
         message: 'Invalid query parameters', details,
         traceId: req.headers['x-correlation-id'] as string ?? '',
       });
@@ -1228,7 +1350,7 @@ export function validateParams(schema: ZodSchema) {
         field: e.path.join('.'), message: e.message,
       }));
       return sendError({
-        res, statusCode: 400, code: 'VALIDATION_ERROR',
+        res, statusCode: 400, name: 'VALIDATION_ERROR',
         message: 'Invalid path parameters', details,
         traceId: req.headers['x-correlation-id'] as string ?? '',
       });
@@ -1241,13 +1363,12 @@ export function validateParams(schema: ZodSchema) {
 
 **`src/services/discount.service.ts`:**
 ```typescript
-// Pure functions — no side effects, trivially testable
-
-const DISCOUNT_MULTIPLIERS: Record<string, number> = {
-  SILVER:   0.95,
-  GOLD:     0.90,
-  PLATINUM: 0.85,
-};
+// Presentation wrapper around the SHARED pricing function.
+// 🔒 The price math itself lives in @skyhub/common-utils (`calculateFinalPrice`) and
+// is called with the same inputs by the Booking Service to compute the charge —
+// that is Feature 4's price-consistency rule. This file must NEVER reimplement the
+// multiplication; it only adds display fields (discountPercent, tier echo).
+import { calculateFinalPrice } from '@skyhub/common-utils';
 
 const DISCOUNT_PERCENT: Record<string, number> = {
   SILVER:   5,
@@ -1263,11 +1384,13 @@ export interface PricedFlight {
 }
 
 export function applyDiscount(basePrice: number, loyaltyTier: string): PricedFlight {
-  const multiplier    = DISCOUNT_MULTIPLIERS[loyaltyTier] ?? DISCOUNT_MULTIPLIERS.SILVER;
-  const discountPct   = DISCOUNT_PERCENT[loyaltyTier]     ?? DISCOUNT_PERCENT.SILVER;
-  const discountedPrice = Math.round(basePrice * multiplier);  // integer paise, no float
-
-  return { basePrice, discountedPrice, discountPercent: discountPct, loyaltyTier };
+  const tier = DISCOUNT_PERCENT[loyaltyTier] !== undefined ? loyaltyTier : 'SILVER';
+  return {
+    basePrice,
+    discountedPrice: calculateFinalPrice(basePrice, tier),  // ← shared with Booking — never inline the math
+    discountPercent: DISCOUNT_PERCENT[tier],
+    loyaltyTier:     tier,
+  };
 }
 
 export function extractLoyaltyTier(header: string | string[] | undefined): string {
@@ -1392,6 +1515,7 @@ export const flightRepository = {
       departureDate:  filter.departureDate,
       cabinClass:     filter.cabinClass,
       availableSeats: { $gte: filter.minSeats },
+      status:         { $in: ['SCHEDULED', 'DELAYED'] },  // BOARDING/DEPARTED are not bookable
     })
     .hint({ origin: 1, destination: 1, departureDate: 1, cabinClass: 1 })  // force compound index
     .lean()  // returns plain JS objects, not Mongoose Documents — faster for serialization
@@ -1470,11 +1594,12 @@ export async function checkDatabaseConnection(): Promise<'ok' | string> {
 import Redis  from 'ioredis';
 import { env } from './env.js';
 
+// Connects to the redis-cache INSTANCE (:6380, allkeys-lru) — never redis-core (:6379).
+// Eviction-policy isolation is per-instance, so no logical-DB tricks needed (DB 0).
 export const redis = new Redis(env.REDIS_URL, {
   maxRetriesPerRequest: 3,
   enableReadyCheck:     true,
   lazyConnect:          false,
-  db:                   1,  // Search Service uses Redis DB 1 exclusively
 });
 
 redis.on('error', (err) => {
@@ -1533,7 +1658,7 @@ export const cacheService = {
 import { Router }               from 'express';
 import { checkDatabaseConnection } from '../config/database.js';
 import { checkRedisConnection }    from '../config/redis.js';
-import { consumer }                from '../events/consumers/consumer.factory.js';
+import { isConsumerHealthy }       from '../events/consumers/consumer.factory.js';
 
 const router = Router();
 
@@ -1543,14 +1668,8 @@ router.get('/health', async (req, res) => {
     checkRedisConnection(),
   ]);
 
-  // Kafka consumer health: check if it is still connected
-  let kafka: string;
-  try {
-    // KafkaJS does not expose a ping — check internal state description
-    kafka = (consumer as any)._status === 'RUNNING' ? 'ok' : 'error: consumer not running';
-  } catch {
-    kafka = 'error: status unknown';
-  }
+  // Kafka consumer health via lifecycle-event flag (see consumer.factory.ts)
+  const kafka = isConsumerHealthy() ? 'ok' : 'error: consumer not running';
 
   const checks  = { mongodb, redis: redisStatus, kafka };
   const healthy = Object.values(checks).every((v) => v === 'ok');
@@ -1623,7 +1742,7 @@ import { logger }     from './config/logger.js';
 import searchRouter   from './routes/search.routes.js';
 import healthRouter   from './routes/health.routes.js';
 import metricsRouter  from './routes/metrics.routes.js';
-import { globalErrorHandler } from './middlewares/errorHandler.js';
+import { globalErrorHandler, notFoundHandler } from './middlewares/errorHandler.js';
 
 export const app = express();
 
@@ -1634,15 +1753,13 @@ app.use(pinoHttp({ logger }));
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.use('/api/v1',  searchRouter);    // GET /api/v1/search, GET /api/v1/search/flights/:id
-app.use('/',        healthRouter);    // GET /health
-app.use('/',        metricsRouter);   // GET /metrics
+app.use('/api/v1',  healthRouter);    // GET /api/v1/health (cluster convention)
+app.use('/',        metricsRouter);   // GET /metrics (internal scrape — unversioned)
 
-// ─── 404 handler ──────────────────────────────────────────────────────────────
-app.use((_req, res) => {
-  res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Route not found' } });
-});
+// ─── 404 fallback — common-utils handler (correct envelope incl. traceId) ─────
+app.use(notFoundHandler);
 
-// ─── Global error handler ─────────────────────────────────────────────────────
+// ─── Global error handler — must be last (4-arg) ──────────────────────────────
 app.use(globalErrorHandler);
 ```
 
@@ -1774,8 +1891,9 @@ SERVICE_NAME=search-service
 MONGODB_URI=mongodb://localhost:27017/skyhub_search_db
 
 # ── Redis ─────────────────────────────────────────────────────────────
-# DB 1 is exclusively for Search Service cache. DB 0 is Gateway + User Service.
-REDIS_URL=redis://localhost:6379/1
+# redis-cache instance (allkeys-lru, port 6380) — NEVER redis-core :6379 (noeviction).
+# Separation is per-instance, not per-logical-DB — see 00_Build_Roadmap.md §8.
+REDIS_URL=redis://localhost:6380/0
 
 # ── Kafka ─────────────────────────────────────────────────────────────
 KAFKA_BROKERS=localhost:9092
@@ -1874,7 +1992,7 @@ Work through these steps in order. Validate each step before moving to the next.
 4. Create `src/config/env.ts` (Section 10 code)
 5. Copy `.env.example` to `.env` and fill in values:
    - `MONGODB_URI=mongodb://localhost:27017/skyhub_search_db`
-   - `REDIS_URL=redis://localhost:6379/1`
+   - `REDIS_URL=redis://localhost:6380/0`   ← redis-cache instance, NOT redis-core :6379
    - `KAFKA_BROKERS=localhost:9092`
 
 **Validation:** Run `npm run typecheck` from `services/search-service/`. Zero errors. Run `npm run dev` — if env vars are missing it should crash with a clear Zod field-by-field error list.
@@ -1895,7 +2013,8 @@ import { FlightModel } from './src/models/flight.model.js';
 
 const indexes = await FlightModel.collection.indexes();
 console.log(JSON.stringify(indexes, null, 2));
-// Should show: _id, flightId (unique), idx_search_primary, idx_price, idx_available_seats
+// Should show: _id, flightId (unique), idx_search_primary
+// (idx_price / idx_available_seats are deliberately NOT created in v1 — see §3.5)
 ```
 
 **Validation:** `npm run dev` — should connect to MongoDB and log "MongoDB connected". Check with MongoDB Compass or `mongosh`: `use skyhub_search_db; db.getCollectionNames()` should return `["flights", "user_tiers"]`.
@@ -1955,8 +2074,9 @@ export const userTierRepository = {
 ### Step 5: Service Layer
 
 **What to do:**
-1. Create `src/services/discount.service.ts` (Section 8 code)
-2. Create `src/services/search.service.ts` (Section 8 code)
+1. **First**, add `calculateFinalPrice(basePriceMinorUnits, loyaltyTier)` to `@skyhub/common-utils` — the pure function mandated by `00_Build_Roadmap.md` §6. Search (display) and Booking (charge, Phase 4) must both call it; it does `Math.round(basePrice * multiplier)` with SILVER 0.95 / GOLD 0.90 / PLATINUM 0.85, unknown tier → SILVER.
+2. Create `src/services/discount.service.ts` (Section 8 code — a thin wrapper around the shared function)
+3. Create `src/services/search.service.ts` (Section 8 code)
 
 **Manual validation of discount logic:**
 ```typescript
@@ -1986,33 +2106,10 @@ console.log(applyDiscount(100, 'GOLD')); // { discountedPrice: 90 } — should b
 2. Create `src/types/express.d.ts` (Section 8 code)
 3. Create `src/middlewares/validateQuery.ts` (Section 8 code)
 4. Create `src/middlewares/validateParams.ts` (Section 8 code)
-5. Create `src/middlewares/errorHandler.ts`:
+5. Create `src/middlewares/errorHandler.ts` — thin re-export, same as the other services (do NOT write a local handler; the shared one already emits the `statusCode` + `name` envelope, and a local copy would drift):
 
 ```typescript
-import { Request, Response, NextFunction } from 'express';
-import { AppError } from '@skyhub/common-utils';
-import { logger }   from '../config/logger.js';
-
-export function globalErrorHandler(
-  err: Error, req: Request, res: Response, _next: NextFunction
-) {
-  const traceId = req.headers['x-correlation-id'] as string ?? '';
-
-  if (err instanceof AppError) {
-    return res.status(err.statusCode).json({
-      success: false,
-      error: { code: err.code, message: err.message },
-      traceId,
-    });
-  }
-
-  logger.error({ err, traceId }, 'Unhandled error');
-  res.status(500).json({
-    success: false,
-    error: { code: 'INTERNAL_ERROR', message: 'An unexpected error occurred' },
-    traceId,
-  });
-}
+export { globalErrorHandler, notFoundHandler } from '@skyhub/common-utils';
 ```
 
 6. Create `src/controllers/search.controller.ts`:
@@ -2032,14 +2129,9 @@ export const searchController = {
 
     const result = await searchService.search(params, loyaltyTier);
 
-    if (result.flights.length === 0) {
-      sendError({
-        res, statusCode: 404, code: 'NOT_FOUND',
-        message: 'No flights found matching your search criteria',
-        traceId,
-      });
-      return;
-    }
+    // An empty result set is a SUCCESSFUL query, not an error — return 200 with
+    // an empty array and total: 0. A 404 here breaks "no flights, try other dates"
+    // UI states, pollutes error metrics, and misuses 404 (the /search resource exists).
 
     sendSuccess({
       res, statusCode: 200,
@@ -2074,7 +2166,7 @@ export const searchController = {
 
     if (!flight) {
       sendError({
-        res, statusCode: 404, code: 'NOT_FOUND',
+        res, statusCode: 404, name: 'NOT_FOUND',
         message: 'Flight not found in search index',
         traceId,
       });
@@ -2141,7 +2233,7 @@ export const logger = pino({
 
 10. Create `src/app.ts` (Section 8 code)
 
-**Validation:** Start the service. Hit `GET /api/v1/search` without query params — should return 400 with field-level Zod errors. Hit with valid params but no flights in MongoDB — should return 404.
+**Validation:** Start the service. Hit `GET /api/v1/search` without query params — should return 400 with field-level Zod errors. Hit with valid params but no flights in MongoDB — should return 200 with `flights: []` and `meta.total: 0`.
 
 ---
 
@@ -2174,7 +2266,9 @@ Use `kafkajs` admin or any Kafka UI to publish a test `FLIGHT_UPDATED` message t
   "correlationId": "test",
   "timestamp": "2026-05-28T10:00:00.000Z",
   "payload": {
-    "flightId": "test-flight-uuid-001",
+    "inventoryId": "f47ac10b-58cc-4372-a567-0e02b2c3d401",
+    "flightInstanceId": "f47ac10b-58cc-4372-a567-0e02b2c3d499",
+    "fareClass": "Y",
     "airline": "IndiGo",
     "flightNumber": "6E-204",
     "origin": "DEL",
@@ -2188,7 +2282,8 @@ Use `kafkajs` admin or any Kafka UI to publish a test `FLIGHT_UPDATED` message t
     "basePrice": 499900,
     "availableSeats": 142,
     "totalSeats": 180,
-    "stops": 0
+    "stops": 0,
+    "status": "SCHEDULED"
   }
 }
 ```
@@ -2218,7 +2313,7 @@ docker compose up -d
 npm run dev
 
 # Check health
-curl http://localhost:3006/health
+curl http://localhost:3006/api/v1/health
 # Expected: { "status": "healthy", "checks": { "mongodb": "ok", "redis": "ok", "kafka": "ok" } }
 
 # Check metrics
@@ -2250,7 +2345,7 @@ curl "http://localhost:3006/api/v1/search?from=DEL&to=BOM&date=2026-10-12&passen
 # discountedPrice should be 15% less than basePrice
 
 # 5. Publish SEATS_HELD event — triggers cache invalidation
-# (Kafka message: { eventType: "SEATS_HELD", payload: { flightId: "...", remainingSeats: 140 } })
+# (Kafka message: { eventType: "SEATS_HELD", payload: { inventoryId: "...", remainingSeats: 140 } })
 
 # 6. Run same search (cache MISS again — old entry was invalidated)
 curl "http://localhost:3006/api/v1/search?from=DEL&to=BOM&date=2026-10-12&passengers=2&cabin=ECONOMY"
@@ -2360,8 +2455,12 @@ import { FlightModel } from '../../src/models/flight.model.js';
 
 const request = supertest(app);
 
+// flightId MUST be a UUID — FlightIdParamSchema enforces .uuid() on the detail route,
+// so non-UUID fixture ids would make the doc's own tests 400.
 const testFlight = {
-  flightId:        'test-flight-001',
+  flightId:         'f47ac10b-58cc-4372-a567-0e02b2c3d401',
+  flightInstanceId: 'f47ac10b-58cc-4372-a567-0e02b2c3d499',
+  fareClass:        'Y',
   airline:         'IndiGo',
   flightNumber:    '6E-204',
   origin:          'DEL',
@@ -2387,7 +2486,7 @@ describe('GET /api/v1/search', () => {
   it('returns 400 when required params are missing', async () => {
     const res = await request.get('/api/v1/search');
     expect(res.status).toBe(400);
-    expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    expect(res.body.error.name).toBe('VALIDATION_ERROR');
     expect(res.body.error.details).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ field: 'from' }),
@@ -2408,9 +2507,11 @@ describe('GET /api/v1/search', () => {
     expect(res.status).toBe(400);
   });
 
-  it('returns 404 when no flights match', async () => {
+  it('returns 200 with empty array when no flights match', async () => {
     const res = await request.get('/api/v1/search?from=BLR&to=HYD&date=2026-10-12');
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(200);
+    expect(res.body.data.flights).toEqual([]);
+    expect(res.body.meta.total).toBe(0);
   });
 
   it('returns flights with SILVER discount by default', async () => {
@@ -2436,14 +2537,14 @@ describe('GET /api/v1/search', () => {
   });
 
   it('filters by directOnly=true', async () => {
-    await FlightModel.create({ ...testFlight, flightId: 'one-stop-flight', stops: 1 });
+    await FlightModel.create({ ...testFlight, flightId: 'f47ac10b-58cc-4372-a567-0e02b2c3d402', stops: 1 });
     const res = await request.get('/api/v1/search?from=DEL&to=BOM&date=2026-10-12&directOnly=true');
     expect(res.body.data.flights).toHaveLength(1);
     expect(res.body.data.flights[0].stops).toBe(0);
   });
 
   it('filters by maxPrice in paise', async () => {
-    await FlightModel.create({ ...testFlight, flightId: 'expensive-flight', basePrice: 1000000 });
+    await FlightModel.create({ ...testFlight, flightId: 'f47ac10b-58cc-4372-a567-0e02b2c3d403', basePrice: 1000000 });
     // SILVER discount: 1000000 * 0.95 = 950000 — should be excluded by maxPrice=500000
     const res = await request.get('/api/v1/search?from=DEL&to=BOM&date=2026-10-12&maxPrice=500000');
     expect(res.body.data.flights.every((f: { discountedPrice: number }) => f.discountedPrice <= 500000)).toBe(true);
@@ -2455,7 +2556,7 @@ describe('GET /api/v1/search', () => {
   });
 
   it('sorts by price ascending by default', async () => {
-    await FlightModel.create({ ...testFlight, flightId: 'cheap-flight', basePrice: 100000 });
+    await FlightModel.create({ ...testFlight, flightId: 'f47ac10b-58cc-4372-a567-0e02b2c3d404', basePrice: 100000 });
     const res = await request.get('/api/v1/search?from=DEL&to=BOM&date=2026-10-12');
     const prices = res.body.data.flights.map((f: { discountedPrice: number }) => f.discountedPrice);
     expect(prices).toEqual([...prices].sort((a, b) => a - b));
@@ -2465,10 +2566,10 @@ describe('GET /api/v1/search', () => {
 describe('GET /api/v1/search/flights/:flightId', () => {
   it('returns flight detail with discount applied', async () => {
     const res = await request
-      .get('/api/v1/search/flights/test-flight-001')
+      .get('/api/v1/search/flights/f47ac10b-58cc-4372-a567-0e02b2c3d401')
       .set('X-User-Loyalty-Tier', 'GOLD');
     expect(res.status).toBe(200);
-    expect(res.body.data.flightId).toBe('test-flight-001');
+    expect(res.body.data.flightId).toBe('f47ac10b-58cc-4372-a567-0e02b2c3d401');
     expect(res.body.data.discountedPrice).toBe(449910);
   });
 
@@ -2492,7 +2593,7 @@ describe('GET /api/v1/search/flights/:flightId', () => {
 | `search.service` | > 90% | Sort orders, filter combinations, pagination boundaries, empty results |
 | `flight.consumer` | > 85% | FLIGHT_UPDATED upsert, SEATS_HELD/RELEASED updates, idempotency (replay same event) |
 | Integration: GET /search | > 80% | Happy path, all query params, error cases |
-| Integration: GET /health | > 70% | Healthy, degraded |
+| Integration: GET /api/v1/health | > 70% | Healthy, degraded |
 
 ### Running Tests
 

@@ -1,0 +1,21 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "./generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Airport {
+  id        String   @id @default(uuid())
+  code      String   @unique @db.VarChar(3)
+  name      String   @db.VarChar(150)
+  city      String   @db.VarChar(100)
+  country   String   @db.VarChar(100)
+  timezone  String   @db.VarChar(100)
+
+  @@map("airports")
+}
+
+

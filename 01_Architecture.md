@@ -1,5 +1,7 @@
 # ✈️ SkyHub — Production-Grade Architecture & Engineering Blueprint
 
+> **🗺️ Building this? Start with [`00_Build_Roadmap.md`](00_Build_Roadmap.md).** This document describes the *finished* system; the roadmap tells you what order to build it in, the v1 cut of each service, and the Definition of Done for every phase. Never build from this doc alone.
+
 ## Table of Contents
 
 1. [Business Context & Design Trade-offs](#1-business-context--design-trade-offs)
@@ -32,6 +34,7 @@
 | 3 | **Distributed transactions** across 3 separate databases | Saga Orchestration via RabbitMQ with SagaLog + compensating transactions | Two-Phase Commit across microservices is a latency and availability anti-pattern |
 | 4 | **Personalized pricing without per-request User Service calls** | Stateless RS256 JWT claims propagated as HTTP headers by the Gateway | Zero network overhead for discount lookups during high-volume search |
 | 5 | **Background work must not block API response threads** | BullMQ delayed job queues backed by Redis, consumed by isolated Notification worker | Client gets instant response; emails and reminders are processed asynchronously |
+| 6 | **The price shown in Search must equal the price charged at Booking** | Loyalty discount is a pure function `calculateFinalPrice(basePrice, loyaltyTier)` in `@skyhub/common-utils`, used identically by Search (display) and Booking (charge) | Two services deriving price independently from the same deterministic inputs cannot disagree — no extra network call, no trust in client-submitted prices |
 
 ### Core User Journeys
 
@@ -49,7 +52,7 @@ Three primary flows drive every architectural decision in SkyHub:
 
 ### Synchronous Seat Hold vs. Event-Driven Asynchronous Hold
 
-For Step 1 of the Booking Saga (holding seats), we explicitly chose a **Synchronous HTTP API Call** (`/internal/flights/:id/hold-seats`) rather than a fully asynchronous, event-driven pattern. 
+For Step 1 of the Booking Saga (holding seats), we explicitly chose a **Synchronous HTTP API Call** (`/internal/flights/instances/:id/hold-seats`) rather than a fully asynchronous, event-driven pattern. 
 
 #### Why Not a Purely Event-Driven (Async) Hold?
 In a fully event-driven system:
@@ -68,6 +71,21 @@ We combine synchronous inventory checks with asynchronous transaction finalizati
 To prevent the synchronous call from becoming a single point of failure or slowing down the system, we implement:
 - **Circuit Breaker (`opossum`)**: Instantly fails-fast and shows a helpful error message if the Flight Service becomes unresponsive, rather than exhausting connection pools and hanging the Booking Service.
 - **Internal HTTP Retries with Exponential Backoff (`axios-retry`)**: Automatically retries transient network blips (e.g., 1s, 2s, 4s delay) behind the scenes for maximum reliability.
+
+### Price Consistency Across Services (The Quote Problem)
+
+A subtle distributed-systems bug hides in personalized pricing: Search applies the loyalty discount for display (GOLD sees ₹9,000 on a ₹10,000 fare), but Booking computes the charge independently. If Booking simply reads the base price from Flight Service, the user is quoted ₹9,000 and charged ₹10,000.
+
+**v1 solution — shared deterministic pricing function:**
+```text
+@skyhub/common-utils → calculateFinalPrice(basePriceMinorUnits, loyaltyTier): number
+
+Search Service:  display = calculateFinalPrice(flight.basePrice, X-User-Loyalty-Tier header)
+Booking Service: charge  = calculateFinalPrice(flightSvc.getPrice(flightId), X-User-Loyalty-Tier header)
+```
+Same pure function + same authoritative inputs (base price from Flight Service, tier from the verified JWT) → identical output on both sides. The client **never submits a price** — client-submitted prices are an attack vector.
+
+**Known gap (accepted for v1):** if an admin changes the base price between the user's search and their booking, the user pays the *new* price without warning. Real airlines/OTAs solve this with **signed fare quotes** (Search returns an HMAC-signed `{flightId, finalPrice, tier, expiresAt}` token; Booking validates the signature and honours the quoted price until expiry). This is a planned Phase 7 retrofit — see `00_Build_Roadmap.md` §6.
 
 ### Service-Level Objectives (SLOs)
 
@@ -161,11 +179,15 @@ These targets shape every architectural decision. If a choice helps meet an SLO,
 ═══════════════════════════════════════════════════════════════════════
 
   ┌─────────────────────────────────────────────────────────────┐
-  │  Redis (Single logical instance, multiple logical databases) │
-  │  DB 0: Rate-limit counters + JWT blacklist (Gateway)        │
-  │  DB 1: Search result cache (Search Service)                 │
-  │  DB 2: Idempotency keys (Payment Service)                   │
-  │  DB 3: BullMQ job queues (Booking → Notification)           │
+  │  Redis ×2 (separate instances — different eviction policies) │
+  │                                                              │
+  │  redis-core  (:6379, noeviction — data must never be evicted)│
+  │    DB 0: Rate-limit counters + JWT blacklist (Gateway)       │
+  │    DB 2: Idempotency keys (Payment Service)                  │
+  │    DB 3: BullMQ job queues (Booking → Notification)          │
+  │                                                              │
+  │  redis-cache (:6380, allkeys-lru — safe to evict under load) │
+  │    DB 0: Search result cache + invalidation tags (Search)    │
   └─────────────────────────────────────────────────────────────┘
 
   ┌─────────────────────────────────────────────────────────────┐
@@ -221,7 +243,7 @@ This single diagram shows every service, its database, and every connection (HTT
   │              │  │              │  │  :3006   │  │   :3003      │
   │ PostgreSQL   │  │ PostgreSQL   │  │          │  │              │
   │ skyhub_      │  │ skyhub_      │  │ MongoDB  │  │ PostgreSQL   │
-  │ user_db      │  │ flight_db    │  │ Redis DB1│  │ skyhub_      │
+  │ user_db      │  │ flight_db    │  │RedisCache│  │ skyhub_      │
   │              │  │              │  │          │  │ booking_db   │
   │ RS256 sign   │  │ FOR UPDATE   │  │          │  │ saga_logs    │
   │ bcrypt       │  │ row lock     │  │          │  │              │
@@ -242,7 +264,7 @@ This single diagram shows every service, its database, and every connection (HTT
                                               endpoints:    │ payment_db   │
                                               /hold-seats   │              │
                                               /release-seats│ Redis DB 2   │
-                                                           │ (idempotency)│
+                                              /confirm-seats│ (idempotency)│
                                                            │              │
                                                            │ Stripe SDK ──┼──► stripe.com
                                                            │ ▲            │    (external)
@@ -292,15 +314,17 @@ This single diagram shows every service, its database, and every connection (HTT
 │ API Gateway          │ Search Service       │ HTTP (proxy)  │ Synchronous: user needs search results   │
 │ API Gateway          │ Booking Service      │ HTTP (proxy)  │ Synchronous: booking initiation          │
 │ API Gateway          │ Payment Service      │ HTTP (proxy)  │ Synchronous: payment submission          │
-│ API Gateway          │ Redis (DB 0)         │ Redis proto   │ Rate-limit counters + JWT blacklist      │
-│ Booking Service      │ Flight Service       │ Sync HTTP     │ Seat hold — needs immediate ACID result  │
+│ API Gateway          │ redis-core (DB 0)    │ Redis proto   │ Rate-limit counters + JWT blacklist      │
+│ Search Service       │ redis-cache (DB 0)   │ Redis proto   │ Cache-aside search results + tag sets    │
+│ Booking Service      │ Flight Service       │ Sync HTTP     │ Seat hold/release/confirm — immediate    │
+│                      │                      │               │ ACID result on inventory                 │
 │ Flight Service       │ Kafka                │ Kafka proto   │ Async: FLIGHT_UPDATED event fan-out      │
 │ User Service         │ Kafka                │ Kafka proto   │ Async: USER_REGISTERED/UPDATED event     │
 │ Search Service       │ Kafka (consumer)     │ Kafka proto   │ Consume flight + user events             │
 │ Booking Service      │ RabbitMQ             │ AMQP          │ Guaranteed saga command delivery         │
 │ Payment Service      │ RabbitMQ             │ AMQP          │ Guaranteed saga result delivery          │
-│ Booking Service      │ BullMQ (Redis DB 3)  │ Redis proto   │ Schedule email + reminder + timeout jobs │
-│ Notification Service │ BullMQ (Redis DB 3)  │ Redis proto   │ Consume and process jobs                 │
+│ Booking Service      │ BullMQ (redis-core 3)│ Redis proto   │ Schedule email + reminder + timeout jobs │
+│ Notification Service │ BullMQ (redis-core 3)│ Redis proto   │ Consume and process jobs                 │
 │ Stripe               │ Payment Service      │ HTTPS webhook │ Stripe pushes payment result to us       │
 └──────────────────────┴──────────────────────┴───────────────┴──────────────────────────────────────────┘
 ```
@@ -489,7 +513,7 @@ CLIENT
                                     key = "search:DEL:BOM:2026-10-12:2:ECONOMY"
                                     (origin:dest:date:passengers:cabin — all dimensions included)
                                                │
-                                 5. Redis GET key  (DB 1)
+                                 5. Redis GET key  (redis-cache :6380)
                                     ├── HIT  → deserialize JSON, jump to step 8
                                     └── MISS → query MongoDB:
                                                db.flights.find({
@@ -563,7 +587,7 @@ CLIENT
                                  4. Zod validates payload
 
                                  ─── SAGA STEP 1: HOLD SEATS ───
-                                 5. Sync HTTP PATCH → Flight Service: /internal/flights/:id/hold-seats
+                                 5. Sync HTTP PATCH → Flight Service: /internal/flights/instances/:id/hold-seats
                                     Flight Service:
                                       BEGIN TRANSACTION
                                         SELECT * FROM flights WHERE id = ? FOR UPDATE  ← row lock
@@ -642,12 +666,18 @@ RabbitMQ [skyhub.payment → payment.result: PAYMENT_SUCCESS]
                                  2. BEGIN TRANSACTION
                                       UPDATE bookings SET status='CONFIRMED'
                                       UPDATE saga_logs SET state='COMPLETED'
+                                      INSERT INTO outbox_events (type='CONFIRM_SEATS', ...)
                                     COMMIT
-                                 3. Cancel the seat-hold expiry BullMQ job (it's no longer needed)
+                                 3. (Outbox Worker) HTTP PATCH → Flight Service:
+                                    /internal/flights/instances/:id/confirm-seats
+                                    → marks the seat hold CONFIRMED in the seat_holds table
+                                    → Flight Service's hold-expiry sweeper will now NEVER
+                                      release these seats (see 12.7)
+                                 4. Cancel the seat-hold expiry BullMQ job (it's no longer needed)
                                     bullmq.remove(jobId = bookingId)
-                                 4. BullMQ: add job to 'email-queue'
+                                 5. BullMQ: add job to 'email-queue'
                                     data = { bookingId }  ← store only the ID, not PII
-                                 5. Calculate: reminderFireAt = departureTime - 24 hours
+                                 6. Calculate: reminderFireAt = departureTime - 24 hours
                                     BullMQ: add delayed job to 'reminder-queue'
                                     delay = reminderFireAt - NOW()
                                     data = { bookingId }
@@ -682,7 +712,7 @@ RabbitMQ [payment.result: PAYMENT_FAILED]
 
 (Outbox Worker)
                                  3. Publish RELEASE_SEATS command via HTTP with retry:
-                                    PATCH /internal/flights/:id/release-seats
+                                    PATCH /internal/flights/instances/:id/release-seats
                                     If Flight Service down → retry with exponential backoff
                                     Max 5 retries over 10 minutes
                                     If all retries fail → alert ops team via DLQ
@@ -707,6 +737,8 @@ BullMQ [seat-timeout-queue] fires after 15 minutes
                                     Notification Service sends "Your booking expired" email
 
 ✅ Seats returned to inventory automatically. No manual intervention needed.
+
+> **Defense in depth — why the BullMQ job is not the only safety net:** if Booking Service (or `redis-core`) is down at the moment this job should fire, held seats would leak *forever*. Flight Service therefore runs its own **hold-expiry sweeper** (a periodic loop over its `seat_holds` table releasing ACTIVE holds past `held_until` — see §12.7 and `04_Flight_Service_Design.md` Feature 9b). The BullMQ job is the *fast path* (also flips the booking to TIMED_OUT); the sweeper is the *backstop* that guarantees inventory can never leak even if Booking Service never comes back. Both paths are idempotent against each other via the hold's status column — whichever fires first wins, the other becomes a no-op.
 ```
 
 ### 4.5 SagaLog State Machine
@@ -784,6 +816,7 @@ BullMQ [seat-timeout-queue] fires after 15 minutes
   - `X-User-Role: CUSTOMER | FLIGHT_ADMIN | SUPER_ADMIN`
   - `X-User-Loyalty-Tier: SILVER | GOLD | PLATINUM`
   - `X-User-Jti: <jti>` — JWT ID, forwarded so User Service can write it to the Redis blacklist on logout
+  - `X-User-Exp: <exp>` — JWT expiry (unix seconds) — User Service computes the blacklist TTL as `exp − now` without re-parsing the token
   - `X-Correlation-ID: <uuid>`
 - **Circuit Breaker:** Per-upstream breaker. If User Service returns 5xx 3 times in a row, open the circuit for 30s — return 503 immediately without attempting the call.
 - **API Versioning:** All routes are prefixed `/api/v1/`. Future breaking changes go to `/api/v2/` without disrupting existing clients.
@@ -827,7 +860,9 @@ BullMQ [seat-timeout-queue] fires after 15 minutes
 
 **Responsibilities:**
 - Admin endpoints: create/update/delete flights (RBAC: FLIGHT_ADMIN, SUPER_ADMIN only).
-- Internal endpoints (not proxied by Gateway): `/internal/flights/:id/hold-seats` and `/internal/flights/:id/release-seats` — called only by Booking Service.
+- Internal endpoints (not proxied by Gateway): `/internal/.../hold-seats`, `/internal/.../release-seats`, and `/internal/.../confirm-seats` — called only by Booking Service.
+- Owns the **`seat_holds` table**: every hold is an explicit row (`bookingId`, seats, `held_until`, status `ACTIVE | CONFIRMED | RELEASED | EXPIRED`). Hold/release/confirm are state transitions on this row — this gives free idempotency (PK = bookingId) and makes the sweeper possible.
+- Runs the **hold-expiry sweeper**: every 60s, releases ACTIVE holds whose `held_until` has passed (status → EXPIRED, seats returned). Backstop for Booking Service's BullMQ timeout job — see §12.7.
 - Publishes all mutations to Kafka via Outbox pattern.
 
 ---
@@ -840,7 +875,7 @@ BullMQ [seat-timeout-queue] fires after 15 minutes
 |---|---|---|
 | HTTP Server | Express + TypeScript | Standard |
 | Database | MongoDB via Mongoose | Flexible schema, compound index support for complex filter queries |
-| Cache | Redis `ioredis` (DB 1) | Cache-aside, 5-minute TTL |
+| Cache | Redis `ioredis` (`redis-cache` :6380) | Cache-aside, 5-minute TTL |
 | Kafka Consumer | `kafkajs` (consumer group: `search-service-group`) | Consume flight + user identity events |
 | Logging | `pino` | |
 
@@ -1034,31 +1069,35 @@ DATABASE_URL="postgresql://user:pass@host:5432/db?connection_limit=10&pool_timeo
 
 For production at scale, add **PgBouncer** as a connection pooler between services and PostgreSQL, allowing thousands of app connections to share a small pool of actual DB connections.
 
-### Redis Logical Database Allocation
+### Redis Topology — Two Instances, Not One
 
-A single Redis instance serves four completely separate purposes via logical database numbers. Each service connects to its own DB — no data mixing, no accidental cross-service reads.
+> ⚠️ **A previous version of this design put everything on one Redis instance with different logical DBs and claimed each DB could have its own eviction policy. That is impossible** — `maxmemory-policy` is a per-*instance* setting, not per-DB. On a single `allkeys-lru` instance under memory pressure, Redis could evict **JWT blacklist entries** (logged-out tokens silently become valid again — a security bug) or **BullMQ job state** (BullMQ explicitly requires `noeviction`). Data with different *loss tolerance* must live on different instances.
 
-| DB | Owner | What's Stored | Key Pattern | TTL |
-|----|-------|--------------|-------------|-----|
-| **DB 0** | API Gateway | Rate-limit counters per IP | `rl:{ip}` | 15 min sliding window |
-| **DB 0** | API Gateway | JWT blacklist (on logout) | `blacklist:jti:{jti}` | Token's remaining lifetime |
-| **DB 0** | API Gateway | JWKS public key cache | `jwks:user-service` | 1 hour |
-| **DB 1** | Search Service | Search result cache | `search:{origin}:{dest}:{date}:{pax}:{cabin}` | 5 min |
-| **DB 1** | Search Service | Cache invalidation tag sets | `tag:flight:{flightId}` | 5 min |
-| **DB 2** | Payment Service | Idempotency keys | `idem:{bookingId}` | 30 days |
-| **DB 3** | Booking Service | BullMQ job store (producer) | Internal BullMQ keys | Per-job config |
-| **DB 3** | Notification Service | BullMQ job store (worker) | Internal BullMQ keys | Per-job config |
+We therefore run **two Redis instances**, split by one question: *"Is it acceptable for Redis to silently delete this data when memory is full?"*
 
-**Why separate logical DBs instead of just key prefixes?**
+| Instance | Port | Eviction Policy | DB | Owner | What's Stored | Key Pattern | TTL |
+|----------|------|-----------------|----|-------|--------------|-------------|-----|
+| `redis-core` | 6379 | `noeviction` | DB 0 | API Gateway | Rate-limit counters per IP | `rl:{ip}` | 15 min sliding window |
+| `redis-core` | 6379 | `noeviction` | DB 0 | API Gateway | JWT blacklist (on logout) | `blacklist:jti:{jti}` | Token's remaining lifetime |
+| `redis-core` | 6379 | `noeviction` | DB 0 | API Gateway | JWKS public key cache | `jwks:user-service` | 1 hour |
+| `redis-core` | 6379 | `noeviction` | DB 2 | Payment Service | Idempotency keys | `idem:{bookingId}` | 30 days |
+| `redis-core` | 6379 | `noeviction` | DB 3 | Booking Service | BullMQ job store (producer) | Internal BullMQ keys | Per-job config |
+| `redis-core` | 6379 | `noeviction` | DB 3 | Notification Service | BullMQ job store (worker) | Internal BullMQ keys | Per-job config |
+| `redis-cache` | 6380 | `allkeys-lru` | DB 0 | Search Service | Search result cache | `search:{origin}:{dest}:{date}:{pax}:{cabin}` | 5 min |
+| `redis-cache` | 6380 | `allkeys-lru` | DB 0 | Search Service | Cache invalidation tag sets | `tag:flight:{flightId}` | 5 min |
+
+**Why this split (and what each part teaches):**
 
 | Reason | Explanation |
 |--------|-------------|
-| Accidental wipe safety | `FLUSHDB` on DB 1 (stale search cache) cannot touch DB 0 (JWT blacklist) |
-| Different eviction policies | Cache (DB 1) can use `allkeys-lru`; blacklist (DB 0) must use `noeviction` |
-| Cleaner mental model | Each service's Redis URL in `.env` points to its own DB number — ownership is explicit |
-| Operational isolation | Redis `INFO keyspace` shows per-DB stats; easy to see if the cache is bloated |
+| Eviction safety | The cache instance can evict freely under memory pressure with zero correctness impact. The core instance returns an error on write when full (`noeviction`) — loud failure beats silent data loss for blacklists, idempotency keys, and job queues. |
+| Blast-radius isolation | A cache stampede that fills `redis-cache` cannot degrade BullMQ or the JWT blacklist. |
+| Accidental wipe safety | `FLUSHDB`/`FLUSHALL` against the cache instance cannot touch security or job data. |
+| Cleaner mental model | Each service's `.env` points at exactly one instance + DB number — ownership is explicit. |
 
-**Tag-based cache invalidation (DB 1):**
+**Interview-grade nuance — logical DBs don't survive scale:** Redis Cluster supports **only DB 0**. At real production scale, logical database numbers disappear entirely and you separate concerns by instance (exactly what we do here) plus key prefixes. We still use DB numbers *within* `redis-core` locally for `FLUSHDB` safety and per-DB `INFO keyspace` stats, knowing they're a single-node convenience, not an architectural boundary.
+
+**Tag-based cache invalidation (on `redis-cache`):**
 ```text
 When admin updates flight FL001:
   Search Service Kafka consumer runs:
@@ -1573,6 +1612,37 @@ setInterval(async () => {
 }, 5000);
 ```
 
+**Delivery semantics — say this correctly in interviews:** the outbox pattern gives **at-least-once** delivery, *not* exactly-once. The worker can crash *after* `publishToKafkaOrRabbitMQ` succeeds but *before* the row is marked `PUBLISHED` — on restart it publishes the same event again. Exactly-once *delivery* is impossible in a distributed system; what we achieve is **effectively-once processing**: at-least-once delivery + idempotent consumers (§12.4 — every consumer checks current state / uses upserts before acting). Duplicates are delivered but have no effect.
+
+### 12.7 Seat-Hold Expiry Sweeper (Reconciliation Pattern)
+
+Held seats are normally released by Booking Service's BullMQ `seat-timeout-queue` job. But that single release path has a failure mode: if Booking Service or `redis-core` is down when the job should fire, the seats leak — inventory permanently lost until a human notices.
+
+Production systems pair every event-driven cleanup with a **reconciliation loop** owned by the data's owner. Flight Service owns seat inventory, so Flight Service guarantees holds cannot leak:
+
+```typescript
+// Flight Service — runs every 60 seconds
+setInterval(async () => {
+  const expired = await prisma.seatHold.findMany({
+    where: { status: 'ACTIVE', heldUntil: { lt: new Date() } },
+    take: 100,
+  });
+  for (const hold of expired) {
+    await releaseSeatsForHold(hold);   // same transactional release path as the API,
+                                       // status ACTIVE → EXPIRED guards double-release
+  }
+}, 60_000);
+```
+
+```text
+Race-safety between the two release paths:
+  BullMQ job fires first  → hold status ACTIVE → RELEASED → sweeper later sees non-ACTIVE → no-op
+  Sweeper fires first     → hold status ACTIVE → EXPIRED  → BullMQ release call → no-op (idempotent)
+  Booking CONFIRMED       → hold status CONFIRMED          → sweeper never touches it
+```
+
+**The general lesson:** "event fires exactly when needed" is an optimization, never a guarantee. The guarantee comes from a periodic loop that converges the system to the correct state from the *source of truth* (the `seat_holds` table), no matter what was missed.
+
 ---
 
 ## 13. Folder Structure
@@ -1584,7 +1654,7 @@ SkyHub/                              ← Root Monorepo Directory
 │
 ├── services/                        ← Runnable microservices (each is an independent Node.js process)
 │   │
-│   ├── api-gateway/                 ← Phase 1: Public entry point + reverse proxy
+│   ├── api-gateway/                 ← Phase 2: Public entry point + reverse proxy
 │   │   ├── src/
 │   │   │   ├── config/
 │   │   │   │   ├── env.ts           ← Zod-validated env vars (fails fast if misconfigured)
@@ -1602,14 +1672,18 @@ SkyHub/                              ← Root Monorepo Directory
 │   │   ├── package.json
 │   │   └── tsconfig.json
 │   │
-│   ├── user-service/                ← Phase 1: Identity, auth, loyalty
+│   ├── user-service/                ← Phase 2: Identity, auth, loyalty
 │   │   ├── src/
 │   │   │   ├── config/
 │   │   │   │   ├── env.ts
-│   │   │   │   ├── database.ts      ← Prisma client singleton
+│   │   │   │   ├── prisma.config.ts ← Prisma 7 defineConfig (schema/migrations paths + DB URL)
+│   │   │   │   ├── client.ts        ← Prisma client singleton (pg Pool + @prisma/adapter-pg)
 │   │   │   │   ├── redis.config.ts
 │   │   │   │   └── kafka.config.ts
-│   │   │   ├── models/              ← Prisma schema lives in prisma/schema.prisma
+│   │   │   ├── db/                  ← Prisma 7 layout (same convention as flight-service)
+│   │   │   │   ├── schema.prisma
+│   │   │   │   ├── migrations/
+│   │   │   │   └── generated/prisma/ ← gitignored
 │   │   │   ├── repositories/
 │   │   │   │   ├── user.repository.ts
 │   │   │   │   └── token.repository.ts
@@ -1632,9 +1706,6 @@ SkyHub/                              ← Root Monorepo Directory
 │   │   │   │   └── express.d.ts           ← Augment req with userId, role, correlationId
 │   │   │   ├── app.ts
 │   │   │   └── server.ts
-│   │   ├── prisma/
-│   │   │   ├── schema.prisma
-│   │   │   └── migrations/
 │   │   ├── scripts/
 │   │   │   └── seed.ts                    ← Seeds SUPER_ADMIN, FLIGHT_ADMIN from env vars
 │   │   ├── tests/
@@ -1644,21 +1715,27 @@ SkyHub/                              ← Root Monorepo Directory
 │   │   ├── package.json
 │   │   └── tsconfig.json
 │   │
-│   ├── flight-service/              ← Phase 2: Flight catalog + seat inventory write side
+│   ├── flight-service/              ← Phase 1 (in progress): Flight catalog + seat inventory write side
 │   │   ├── src/
 │   │   │   ├── config/
+│   │   │   │   ├── index.ts                ← Aggregates configs, re-exports prisma client
+│   │   │   │   ├── prisma.config.ts        ← Prisma 7 defineConfig (schema/migrations paths + DB URL)
+│   │   │   │   └── client.ts               ← Prisma client singleton (pg Pool + @prisma/adapter-pg)
+│   │   │   ├── db/                         ← Prisma 7 layout: schema + migrations live inside src/
+│   │   │   │   ├── schema.prisma
+│   │   │   │   ├── migrations/
+│   │   │   │   └── generated/prisma/       ← Generated client (gitignored)
 │   │   │   ├── repositories/
 │   │   │   ├── services/
 │   │   │   ├── controllers/
-│   │   │   ├── routes/
-│   │   │   │   ├── admin.routes.ts         ← /api/v1/flights (FLIGHT_ADMIN only)
-│   │   │   │   └── internal.routes.ts      ← /internal/flights/:id/hold-seats (no Gateway)
+│   │   │   ├── routers/                    ← Versioned: index.router.ts → v1/, v2/
+│   │   │   │   ├── index.router.ts         ← mounted at /api → /api/v1/*, /api/v2/*
+│   │   │   │   ├── v1/                     ← health.router.ts, airport/aircraft/flight routers
+│   │   │   │   └── v2/                     ← placeholder for breaking changes
 │   │   │   ├── middlewares/
 │   │   │   ├── events/
-│   │   │   │   └── outbox.worker.ts
-│   │   │   ├── prisma/
+│   │   │   │   └── outbox.worker.ts        ← Phase 3 (rows written from Phase 1)
 │   │   │   ├── tests/
-│   │   │   ├── app.ts
 │   │   │   └── server.ts
 │   │   ├── .env.example
 │   │   ├── package.json
@@ -1705,7 +1782,7 @@ SkyHub/                              ← Root Monorepo Directory
 │   │   │   │   └── outbox.worker.ts
 │   │   │   ├── workers/
 │   │   │   │   └── seatTimeout.worker.ts    ← BullMQ worker: seat-timeout-queue
-│   │   │   ├── prisma/
+│   │   │   ├── db/                      ← Prisma 7 layout (schema.prisma + migrations + generated client)
 │   │   │   ├── tests/
 │   │   │   ├── app.ts
 │   │   │   └── server.ts
@@ -1730,7 +1807,7 @@ SkyHub/                              ← Root Monorepo Directory
 │   │   │   │   ├── consumers/
 │   │   │   │   │   └── booking.consumer.ts  ← RabbitMQ: BOOKING_INITIATED
 │   │   │   │   └── outbox.worker.ts
-│   │   │   ├── prisma/
+│   │   │   ├── db/                      ← Prisma 7 layout (schema.prisma + migrations + generated client)
 │   │   │   ├── tests/
 │   │   │   ├── app.ts
 │   │   │   └── server.ts
@@ -1863,24 +1940,29 @@ Cache hit: if a package's source files haven't changed, Turbo skips its rebuild
 ### `.env.example` (Root Reference — each service has its own)
 
 ```bash
+# ⚠️ HOSTNAME RULE: services run on the HOST via Turbo (docker-compose is infra-only),
+# so every URL below uses localhost + the published port. Docker service hostnames
+# (postgres, kafka, redis-core…) only become valid if/when the services themselves are
+# containerized in Phase 8 — at that point swap localhost → compose service names.
+
 # ── API Gateway ─────────────────────────────────────────────────────
 GATEWAY_PORT=3000
-USER_SERVICE_URL=http://user-service:3001
-FLIGHT_SERVICE_URL=http://flight-service:3002
-SEARCH_SERVICE_URL=http://search-service:3006
-BOOKING_SERVICE_URL=http://booking-service:3003
-PAYMENT_SERVICE_URL=http://payment-service:3004
-REDIS_URL=redis://redis:6379/0
+USER_SERVICE_URL=http://localhost:3001
+FLIGHT_SERVICE_URL=http://localhost:3002
+SEARCH_SERVICE_URL=http://localhost:3006
+BOOKING_SERVICE_URL=http://localhost:3003
+PAYMENT_SERVICE_URL=http://localhost:3004
+REDIS_URL=redis://localhost:6379/0            # redis-core (noeviction)
 ALLOWED_ORIGINS=http://localhost:5173,https://skyhub.com
 RATE_LIMIT_WINDOW_MS=900000
 RATE_LIMIT_MAX_REQUESTS=100
-JWKS_URI=http://user-service:3001/.well-known/jwks.json
+JWKS_URI=http://localhost:3001/.well-known/jwks.json
 
 # ── User Service ─────────────────────────────────────────────────────
 PORT=3001
-DATABASE_URL=postgresql://user:pass@postgres:5432/skyhub_user_db?connection_limit=10
-REDIS_URL=redis://redis:6379/0
-KAFKA_BROKERS=kafka:9092
+DATABASE_URL=postgresql://skyhub:skyhub_local@localhost:5432/skyhub_user_db?connection_limit=10
+REDIS_URL=redis://localhost:6379/0            # redis-core (jti blacklist writes)
+KAFKA_BROKERS=localhost:9092
 JWT_PRIVATE_KEY_PATH=./keys/private.pem
 JWT_PUBLIC_KEY_PATH=./keys/public.pem
 JWT_ACCESS_TOKEN_EXPIRY=15m
@@ -1891,42 +1973,51 @@ SUPER_ADMIN_PASSWORD=<from-secrets-manager>
 
 # ── Flight Service ───────────────────────────────────────────────────
 PORT=3002
-DATABASE_URL=postgresql://user:pass@postgres:5432/skyhub_flight_db?connection_limit=10
-KAFKA_BROKERS=kafka:9092
+DATABASE_URL=postgresql://skyhub:skyhub_local@localhost:5432/skyhub_flight_db?connection_limit=10
+KAFKA_BROKERS=localhost:9092
+SEAT_HOLD_DURATION_MINUTES=15
+HOLD_SWEEPER_INTERVAL_MS=60000                # hold-expiry sweeper tick (Feature 9b in 04_*.md)
+INTERNAL_API_SECRET=<openssl rand -hex 32>    # validated on every /internal/* request
 
 # ── Search Service ───────────────────────────────────────────────────
 PORT=3006
-MONGODB_URI=mongodb://mongo:27017/skyhub_search_db
-REDIS_URL=redis://redis:6379/1
-KAFKA_BROKERS=kafka:9092
+MONGODB_URI=mongodb://localhost:27017/skyhub_search_db
+REDIS_URL=redis://localhost:6380/0            # redis-cache (allkeys-lru) — NOT redis-core
+KAFKA_BROKERS=localhost:9092
 KAFKA_GROUP_ID=search-service-group
 
 # ── Booking Service ──────────────────────────────────────────────────
 PORT=3003
-DATABASE_URL=postgresql://user:pass@postgres:5432/skyhub_booking_db?connection_limit=10
-RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
-REDIS_URL=redis://redis:6379/3
-FLIGHT_SERVICE_INTERNAL_URL=http://flight-service:3002
+DATABASE_URL=postgresql://skyhub:skyhub_local@localhost:5432/skyhub_booking_db?connection_limit=10
+RABBITMQ_URL=amqp://guest:guest@localhost:5672
+REDIS_URL=redis://localhost:6379/3            # redis-core (BullMQ requires noeviction)
+FLIGHT_SERVICE_INTERNAL_URL=http://localhost:3002
+INTERNAL_API_SECRET=<same value as Flight Service>
+SEAT_HOLD_DURATION_MINUTES=15                 # must match Flight Service exactly
 
 # ── Payment Service ──────────────────────────────────────────────────
 PORT=3004
-DATABASE_URL=postgresql://user:pass@postgres:5432/skyhub_payment_db?connection_limit=10
-RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
-REDIS_URL=redis://redis:6379/2
+DATABASE_URL=postgresql://skyhub:skyhub_local@localhost:5432/skyhub_payment_db?connection_limit=10
+RABBITMQ_URL=amqp://guest:guest@localhost:5672
+REDIS_URL=redis://localhost:6379/2            # redis-core (idempotency keys must never evict)
 STRIPE_SECRET_KEY=sk_test_<your-stripe-test-key>
 STRIPE_WEBHOOK_SECRET=whsec_<your-webhook-secret>
 CURRENCY=INR
 
 # ── Notification Service ─────────────────────────────────────────────
-REDIS_URL=redis://redis:6379/3
-SENDGRID_API_KEY=SG.<your-sendgrid-key>
+REDIS_URL=redis://localhost:6379/3            # redis-core (BullMQ worker side)
+# Local dev: Mailpit SMTP catcher (UI at http://localhost:8025)
+SMTP_HOST=localhost
+SMTP_PORT=1025
+# Production swap: set EMAIL_PROVIDER=sendgrid + SENDGRID_API_KEY=SG.<key>
 EMAIL_FROM=noreply@skyhub.com
-BOOKING_SERVICE_INTERNAL_URL=http://booking-service:3003
+BOOKING_SERVICE_INTERNAL_URL=http://localhost:3003
+INTERNAL_API_SECRET=<same value as Booking Service>
 
 # ── Shared ───────────────────────────────────────────────────────────
 NODE_ENV=development
 LOG_LEVEL=info
-OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318/v1/traces
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318/v1/traces
 ```
 
 ### Env Validation on Startup
@@ -1989,13 +2080,32 @@ services:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 5s
 
-  redis:
+  # Core Redis — security & job data. MUST be noeviction (BullMQ requirement;
+  # evicting a JWT-blacklist or idempotency key is a correctness bug).
+  redis-core:
     image: redis:7-alpine
     ports: ["6379:6379"]
+    command: redis-server --maxmemory 256mb --maxmemory-policy noeviction
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+
+  # Cache Redis — search results only. Safe to evict under memory pressure.
+  redis-cache:
+    image: redis:7-alpine
+    ports: ["6380:6379"]
     command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
+
+  # Local SMTP catcher — Notification Service emails land in the Mailpit UI
+  # (http://localhost:8025) instead of real inboxes. SendGrid is a prod config swap.
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "1025:1025"    # SMTP
+      - "8025:8025"    # Web UI
 
   kafka:
     image: confluentinc/cp-kafka:7.7.0
@@ -2077,29 +2187,20 @@ npm run dev
 
 ## 16. Build Phases Roadmap
 
-| Phase | Services Built | Key Concepts Learned |
+> **The detailed, authoritative version of this roadmap — with the v1 scope cut, learning checkpoints, and a Definition of Done checklist for every phase — lives in [`00_Build_Roadmap.md`](00_Build_Roadmap.md).** The summary below exists so this document stays self-contained.
+
+| Phase | Built | Key Concepts Learned |
 |---|---|---|
-| **Phase 1** | `user-service` + `api-gateway` | RS256 JWT, refresh tokens, Redis blacklist, rate limiting, circuit breakers, Outbox pattern |
-| **Phase 2** | `flight-service` | RBAC enforcement, Kafka producer, Outbox pattern, internal vs external routes |
-| **Phase 3** | `search-service` | CQRS read model, Kafka consumer, tag-based cache invalidation, MongoDB indexes |
-| **Phase 4** | `booking-service` | Saga orchestration, seat hold/expiry, transactional outbox, BullMQ, consumer idempotency |
-| **Phase 5** | `payment-service` | Stripe PaymentIntents + webhooks, idempotency engine, minor-unit currency, refund flow |
-| **Phase 6** | `notification-service` | BullMQ workers, PDFKit, SendGrid, DLQ, PII-safe job data |
-| **Phase 7** | Shared packages | `shared-types`, `common-utils`, `message-broker` — extract and centralize shared code |
-| **Phase 8** | Observability | Pino structured logging, prom-client metrics, OpenTelemetry traces, Grafana dashboards |
+| **Phase 1** | `flight-service` v1 *(in progress)* | Layered architecture, Prisma migrations + transactions, `FOR UPDATE` row locking, `seat_holds` state table, idempotency, reconciliation sweeper, seeding |
+| **Phase 2** | `user-service` v1 + `api-gateway` v1 | bcrypt, RS256 JWT + JWKS, refresh token hashing + rotation, trusted-header pattern, distributed rate limiting |
+| **Phase 3** | `search-service` v1 + Kafka live | CQRS read model, outbox worker + Kafka producer/consumer, at-least-once + idempotent upserts, tag-based cache invalidation, MongoDB indexes |
+| **Phase 4** | `booking-service` v1 (fake payment consumer) | Saga orchestration, compensating transactions, transactional outbox end-to-end, BullMQ delayed jobs, consumer idempotency, message-contract-first design |
+| **Phase 5** | `payment-service` v1 (replaces fake) | Stripe PaymentIntents + webhook signature verification, idempotency engine, minor-unit currency |
+| **Phase 6** | `notification-service` v1 | BullMQ workers, PDFKit, SMTP via Mailpit locally (SendGrid = prod config swap), DLQ + replay, PII-safe job data |
+| **Phase 7** | v2/v3 retrofits | Account lockout, OTP verification, MFA, dynamic RBAC, fare quotes, refunds, circuit breakers — practicing change on a *running* system |
+| **Phase 8** | Hardening | prom-client metrics + Grafana, OpenTelemetry → Jaeger, k6 load tests vs the SLOs in §1, service Dockerfiles, CI/CD, OpenAPI from Zod schemas |
 
-### Phase 1 Detailed Build Order (User Service + API Gateway)
-
-1. **Bootstrap monorepo:** Fill in `services/user-service/package.json` and `tsconfig.json`. Set up Prisma with `schema.prisma`.
-2. **Database models:** User, RefreshToken, OutboxEvent tables with all production columns (`email_verified`, `is_active`, `failed_login_attempts`, `locked_until`, `last_login_at`).
-3. **Common utilities:** `AppError` class, Pino logger with `AsyncLocalStorage`, Zod env validator.
-4. **Repository layer:** `user.repository.ts`, `token.repository.ts` — raw Prisma queries only.
-5. **Service layer:** `auth.service.ts` (register, login, logout), `token.service.ts` (JWT sign/verify with RS256, refresh token management with hashed storage and rotation).
-6. **Controller + Routes:** `auth.controller.ts`, Zod schemas, standard response envelope.
-7. **Outbox Worker:** Polls `outbox_events`, publishes to Kafka, marks published.
-8. **API Gateway:** Rate limiting, RS256 JWT verify via JWKS, Redis blacklist check, circuit breaker, proxy routes.
-9. **Health checks:** `GET /health` on both services.
-10. **Validation:** Full flow test — register → login → search with JWT → refresh → logout → verify blacklist.
+**Why Flight Service first (not User Service):** plain CRUD plus one genuinely hard problem (concurrent holds) teaches the foundational skills without the cryptographic state of auth; Kafka waits until something consumes it (Phase 3); payment integrates first against a fake consumer behind a stable message contract (Phase 4→5) — the same de-risking pattern real teams use.
 
 ---
 

@@ -1,35 +1,20 @@
-// import { Response } from 'express';
+import { Response } from "express";
+import { StatusCodes } from "http-status-codes";
+import type { SuccessResponse, PaginationMeta } from "@skyhub/shared-types";
 
-// export interface PaginationMeta {
-//   page: number;
-//   limit: number;
-//   total: number;
-// }
+/** 200 OK with data (optionally paginated). */
+export function ok<T>(res: Response, data: T, meta?: PaginationMeta): void {
+  const body: SuccessResponse<T> = { success: true, data, ...(meta ? { meta } : {}) };
+  res.status(StatusCodes.OK).json(body);
+}
 
-// function resolveTraceId(res: Response): string {
-//   const header = res.req?.headers?.['x-correlation-id'];
-//   return typeof header === 'string' ? header : 'unknown';
-// }
+/** 201 Created with the new resource. */
+export function created<T>(res: Response, data: T): void {
+  const body: SuccessResponse<T> = { success: true, data };
+  res.status(StatusCodes.CREATED).json(body);
+}
 
-// export function ok<T>(res: Response, data: T, message = 'Success', meta?: PaginationMeta): void {
-//   res.status(200).json({
-//     success: true,
-//     message,
-//     data,
-//     ...(meta && { meta }),
-//     traceId: resolveTraceId(res),
-//   });
-// }
-
-// export function created<T>(res: Response, data: T, message = 'Created'): void {
-//   res.status(201).json({
-//     success: true,
-//     message,
-//     data,
-//     traceId: resolveTraceId(res),
-//   });
-// }
-
-// export function noContent(res: Response): void {
-//   res.status(204).send();
-// }
+/** 204 No Content (e.g. after a delete) — no body. */
+export function noContent(res: Response): void {
+  res.status(StatusCodes.NO_CONTENT).send();
+}

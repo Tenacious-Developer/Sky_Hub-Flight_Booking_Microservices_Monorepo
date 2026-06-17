@@ -19,3 +19,6 @@ npm-debug.log*
 
 # IDE and Editors
 .idea/
+
+# Prisma generated client (also ignored per-service)
+services/*/src/db/generated/
