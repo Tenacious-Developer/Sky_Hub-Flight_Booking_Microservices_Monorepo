@@ -11,7 +11,7 @@ export type ErrorResponse = {
     details?: ErrorDetail[];
   };
   meta: {
-    traceId: string;
+    correlationId: string;
     timestamp: string;
   };
 };

@@ -13,7 +13,7 @@ function respond(res: Response, status: number, code: string, message: string, d
   const body: ErrorResponse = {
     success: false,
     error: { code, message, ...(details?.length ? { details } : {}) },
-    meta: { traceId: getCorrelationId() ?? "unknown", timestamp: new Date().toISOString() }, // ← from context
+    meta: { correlationId: getCorrelationId() ?? "unknown", timestamp: new Date().toISOString() }, // ← from context
   };
   res.status(status).json(body);
 }
