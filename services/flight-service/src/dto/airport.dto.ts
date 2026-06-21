@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { createAirportSchema } from "../validators/airport.validator";
+import { airportParamSchema, createAirportSchema, listAirportsQuerySchema, updateAirportSchema } from "../validators/airport.validator";
 
 // (a) what the repo RECEIVES — request shape derived from Zod. No Prisma.
 export type CreateAirportDTO = z.infer<typeof createAirportSchema>;
@@ -34,5 +34,8 @@ export function toAirportResponse(airport: Airport): ResponseAirportDTO {
     };
 }
 
+export type ListAirportsQueryDTO = z.infer<typeof listAirportsQuerySchema>;
 
+export type AirportParamsDTO = z.infer<typeof airportParamSchema>;
 
+export type UpdateAirportDTO = z.infer<typeof updateAirportSchema>;

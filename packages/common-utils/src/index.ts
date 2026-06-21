@@ -6,7 +6,7 @@ export {
 } from "./errors/app.error.js";
 
 // HTTP response helpers
-export { ok, created, noContent } from "./http/response.js";
+export { ok, created, okMessage, noContent } from "./http/response.js";
 
 // Middleware
 export { globalErrorHandler } from "./middleware/errorHandler.js";

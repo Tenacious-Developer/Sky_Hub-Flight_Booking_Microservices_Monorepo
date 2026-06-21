@@ -6,12 +6,10 @@ export type ErrorDetail = {
 export type ErrorResponse = {
   success: false;
   error: {
-    code: string;
+    statusCode: number;
+    name: string;
     message: string;
-    details?: ErrorDetail[];
+    details: ErrorDetail[];
   };
-  meta: {
-    correlationId: string;
-    timestamp: string;
-  };
+  traceId: string; // correlation id for this request (mirrors x-correlation-id header)
 };

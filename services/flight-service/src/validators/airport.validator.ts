@@ -14,3 +14,22 @@ export const createAirportSchema = z.object({
 });
 
 
+export const listAirportsQuerySchema = z.object({
+    country: z.string().trim().min(1).optional(),
+    search: z.string().trim().min(1).optional(),
+});
+
+export const airportParamSchema = z.object({
+    code: z.string()
+        .trim()
+        .length(3, "Airport code must be exactly 3 characters long")
+        .regex(/^[a-zA-Z]{3}$/, "Airport code must be 3 letters (IATA)")
+        .toUpperCase(),
+})
+
+export const updateAirportSchema = createAirportSchema
+    .omit({ code: true })
+    .partial()
+    .refine((obj) => Object.keys(obj).length > 0, {
+        message: "At least one field must be provided to update",
+    });

@@ -9,11 +9,11 @@ import { getCorrelationId } from "../context/request-context.js";
 
 const isProd = process.env.NODE_ENV === "production";        
 
-function respond(res: Response, status: number, code: string, message: string, details?: ErrorDetail[]) {
+function respond(res: Response, status: number, name: string, message: string, details: ErrorDetail[] = []) {
   const body: ErrorResponse = {
     success: false,
-    error: { code, message, ...(details?.length ? { details } : {}) },
-    meta: { correlationId: getCorrelationId() ?? "unknown", timestamp: new Date().toISOString() }, // ← from context
+    error: { statusCode: status, name, message, details },
+    traceId: getCorrelationId() ?? "unknown", // ← from context, mirrors x-correlation-id header
   };
   res.status(status).json(body);
 }
