@@ -25,7 +25,14 @@ export const validateRequest = (schemas: RequestSchemas) => {
     try {
       if (schemas.body) req.body = await schemas.body.parseAsync(req.body);
       if (schemas.params) await schemas.params.parseAsync(req.params); // validate only
-      if (schemas.query) await schemas.query.parseAsync(req.query); // validate only
+      if (schemas.query) {
+        // Express 5 makes req.query a read-only getter, so a plain reassign throws.
+        // defineProperty lets the parsed value (with Zod coercions/transforms, e.g.
+        // string "150" → number 150) persist for controllers — otherwise the
+        // original string query reaches the repo and Prisma rejects it.
+        const parsedQuery = await schemas.query.parseAsync(req.query);
+        Object.defineProperty(req, "query", { value: parsedQuery, configurable: true });
+      }
       next();
     } catch (err) {
       if (err instanceof ZodError) {
@@ -35,3 +42,4 @@ export const validateRequest = (schemas: RequestSchemas) => {
     }
   };
 };
+

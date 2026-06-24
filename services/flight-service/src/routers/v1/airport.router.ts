@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { createAirportHandler, getAllAirportsHandler, getAirportHandler, updateAirportHandler, deleteAirportHandler } from "../../controllers/airport.controller";
+import { createAirportHandler, getAllAirportsHandler, getAirportHandler, updateAirportHandler, deactivateAirportHandler } from "../../controllers/airport.controller";
 import { validateRequest } from "@skyhub/common-utils";
 import { airportParamSchema, createAirportSchema, listAirportsQuerySchema, updateAirportSchema } from "../../validators/airport.validator";
 
@@ -9,7 +9,7 @@ airportRouter.post('/', validateRequest({ body: createAirportSchema }), createAi
 airportRouter.get('/', validateRequest({query: listAirportsQuerySchema}), getAllAirportsHandler);
 airportRouter.get('/:code', validateRequest({params: airportParamSchema}), getAirportHandler);
 airportRouter.patch('/:code', validateRequest({ params: airportParamSchema, body: updateAirportSchema }), updateAirportHandler);
-airportRouter.delete('/:code', validateRequest({ params: airportParamSchema }), deleteAirportHandler);
+airportRouter.delete('/:code', validateRequest({ params: airportParamSchema }), deactivateAirportHandler);
 
 export default airportRouter
     

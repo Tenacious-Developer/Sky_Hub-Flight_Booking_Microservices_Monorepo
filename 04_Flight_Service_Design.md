@@ -22,7 +22,7 @@ The Flight Service is the **exclusive write-side owner of the flight catalog and
 
 **Features (one line each):**
 - **Airport CRUD** — reference data; IATA `code` is the key. FK target for schedules.
-- **Aircraft CRUD** — fleet reference (`model`, `totalCapacity`). FK target for schedules.
+- **Aircraft CRUD** — fleet reference (`registration`, `model`, `totalCapacity`); `registration` (tail number) is the unique business key that prevents duplicate aircraft. FK target for schedules.
 - **Flight Schedule CRUD** — recurring route template (`6E-204 DEL→BOM 06:30`). No date.
 - **Flight Instance CRUD** — a dated, flyable flight + its seat-inventory buckets.
 - **Seat Inventory update** — price / seat-count / policy changes per cabin bucket.
@@ -101,11 +101,11 @@ BOOKING SERVICE (internal network only — never via Gateway)
 │            AIRPORTS             │   │            AIRCRAFTS              │
 ├─────────────────────────────────┤   ├──────────────────────────────────┤
 │ id       UUID        PK         │   │ id             UUID       PK     │
-│ code     VARCHAR(3)  UNIQUE     │   │ model          VARCHAR(100)      │
-│ name     VARCHAR(150) NOT NULL  │   │ total_capacity INT               │
-│ city     VARCHAR(100) NOT NULL  │   └────────────────┬─────────────────┘
-│ country  VARCHAR(100) NOT NULL  │                    │ 1 (aircraft_id FK)
-│ timezone VARCHAR(100) NOT NULL  │                    │
+│ code     VARCHAR(3)  UNIQUE     │   │ registration   VARCHAR(10) UNIQUE│
+│ name     VARCHAR(150) NOT NULL  │   │ model          VARCHAR(100)      │
+│ city     VARCHAR(100) NOT NULL  │   │ total_capacity INT               │
+│ country  VARCHAR(100) NOT NULL  │   └────────────────┬─────────────────┘
+│ timezone VARCHAR(100) NOT NULL  │                    │ 1 (aircraft_id FK)
 └───────────────┬─────────────────┘                    │
                 │ 1 (origin_airport_id +               │
                 │    destination_airport_id FKs)       │ has many schedules
@@ -193,12 +193,18 @@ The Flight Service does NOT call User Service to validate this UUID. It trusts t
 | `id` | UUID | Unique surrogate primary key. |
 | `code` | VARCHAR(3) | IATA 3-letter airport codes. Unique, uppercase index. |
 | `timezone` | VARCHAR(100) | Canonical timezone identifiers (e.g. `Asia/Kolkata`). Essential for multi-leg flight tracking. |
+| `is_active` | BOOLEAN | Soft-delete flag (default `true`). `DELETE /airports/:code` sets it to `false` instead of removing the row, so historical schedules referencing this airport (origin/destination FK) stay intact. List/get filter `is_active = true`, so deactivated airports vanish from reads but the data survives. Not exposed in the API response envelope. |
+| `created_at` / `updated_at` | TIMESTAMPTZ | Audit timestamps for reference data. `updated_at` answers "when was this airport detail last corrected" after a PATCH. Not exposed in the API response envelope. |
 
 #### `aircrafts` table
 | Column | Type | Why This Design |
 |---|---|---|
-| `id` | UUID | Unique identifier. |
+| `id` | UUID | Unique surrogate identifier. Not a dedup key — a fresh UUID per row can never detect a duplicate aircraft. |
+| `registration` | VARCHAR(10) UNIQUE | Tail number (e.g. `VT-ABC`, `N3730B`) — the real-world identity of a physical aircraft. The unique business key: blocks duplicate aircraft via DB constraint (P2002 → 409). Normalized to uppercase in Zod so case-variant duplicates can't slip past the constraint. |
+| `model` | VARCHAR(100) | Aircraft type label (e.g. `Airbus A320`). Not unique — a fleet has many planes of the same model. |
 | `total_capacity` | INT | Hard ceiling for physical passenger count validation. |
+| `is_active` | BOOLEAN | Soft-delete flag (default `true`). `DELETE /aircrafts/:id` sets it to `false` instead of removing the row, so schedules referencing this aircraft (`aircraft_id` FK) stay intact. List/get filter `is_active = true`, so retired aircraft vanish from reads but the data survives. Not exposed in the API response envelope. |
+| `created_at` / `updated_at` | TIMESTAMPTZ | Audit timestamps for fleet reference data. `updated_at` tracks when an aircraft record (e.g. `total_capacity`) was last corrected via PATCH. Not exposed in the API response envelope. |
 
 #### `flight_schedules` table
 | Column | Type | Why This Design |
@@ -265,10 +271,14 @@ ALTER TABLE flight_schedules
 **File: `services/flight-service/src/db/schema.prisma`**
 
 > **Prisma 7 layout (as implemented):** the schema lives at `src/db/schema.prisma`, migrations at `src/db/migrations/`, and the generated client at `src/db/generated/prisma/` (gitignored). The datasource `url` is **not** in the schema — it comes from `src/config/prisma.config.ts` (Prisma 7 `defineConfig`), and every Prisma CLI command runs with `--config src/config/prisma.config.ts` (wrapped by the `db:*` npm scripts). At runtime the client is constructed with the `pg` driver adapter: `new PrismaClient({ adapter: new PrismaPg(pool) })`.
+>
+> **Generator must be `prisma-client` (modern ESM), NOT `prisma-client-js` (legacy).** The runtime imports `PrismaClient`/`Prisma` from the generated `client` entrypoint (`src/db/generated/prisma/client`), which only the modern `prisma-client` generator produces (it emits `client.ts` + a `models/` folder). Using `prisma-client-js` writes a different layout (`index.d.ts` delegates) that the `/client` import never picks up, so newly-added models silently fail to appear — regenerating won't fix it until the provider is corrected and the stale output deleted.
+>
+> **Migrations:** `npm run db:migrate` (= `prisma migrate dev`) is interactive — run it in a real terminal; it prompts for a migration name and for confirmation on warnings. In non-interactive contexts apply migrations with `prisma migrate deploy` instead. Adding a required+unique column (e.g. `registration`) to a table that already has rows fails — clear/seed the rows first (or backfill via `--create-only` then edit the SQL).
 
 ```prisma
 generator client {
-  provider = "prisma-client-js"
+  provider = "prisma-client"
   output   = "./generated/prisma"
 }
 
@@ -315,6 +325,9 @@ model Airport {
   city      String   @db.VarChar(100)
   country   String   @db.VarChar(100)
   timezone  String   @db.VarChar(100)
+  isActive  Boolean  @default(true) @map("is_active")   // soft-delete flag (DELETE flips this, never removes the row)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
   departingSchedules FlightSchedule[] @relation("OriginAirport")
   arrivingSchedules  FlightSchedule[] @relation("DestinationAirport")
@@ -324,8 +337,12 @@ model Airport {
 
 model Aircraft {
   id            String   @id @default(uuid())
+  registration  String   @unique @db.VarChar(10)   // tail number — unique business key (P2002 → 409)
   model         String   @db.VarChar(100)
   totalCapacity Int      @map("total_capacity")
+  isActive      Boolean  @default(true) @map("is_active")   // soft-delete flag (DELETE flips this, never removes the row)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
 
   schedules     FlightSchedule[]
 
@@ -437,6 +454,8 @@ model OutboxEvent {
 
 | Index | Columns | Type | Purpose |
 |---|---|---|---|
+| `airports_code_key` | `code` on `airports` | Unique | One airport per IATA code |
+| `aircrafts_registration_key` | `registration` on `aircrafts` | Unique | One aircraft per tail number — blocks duplicate aircraft (P2002 → 409) |
 | `uq_schedule_identity` | `(flightNumber, originAirportId, destinationAirportId)` | Unique | Prevent duplicate route declarations |
 | `idx_schedule_active_route` | `(originAirportId, destinationAirportId, isActive)` | B-Tree | High-speed active route lookup |
 | `uq_flight_instance` | `(scheduleId, departureDate)` | Unique | Block duplicate flights on same route same day |
@@ -491,10 +510,12 @@ Read X-User-Role header
 | `GET /api/v1/airports/:code` | No auth required (public — for UI autocomplete) |
 | `POST /api/v1/airports` | `SUPER_ADMIN` |
 | `PATCH /api/v1/airports/:code` | `SUPER_ADMIN` |
+| `DELETE /api/v1/airports/:code` | `SUPER_ADMIN` (soft-delete → `isActive = false`) |
 | `GET /api/v1/aircrafts` | `FLIGHT_ADMIN` |
 | `GET /api/v1/aircrafts/:id` | `FLIGHT_ADMIN` |
 | `POST /api/v1/aircrafts` | `FLIGHT_ADMIN` |
 | `PATCH /api/v1/aircrafts/:id` | `FLIGHT_ADMIN` |
+| `DELETE /api/v1/aircrafts/:id` | `FLIGHT_ADMIN` (soft-delete → `isActive = false`) |
 | `POST /api/v1/flights/schedules` | `FLIGHT_ADMIN` |
 | `GET /api/v1/flights/schedules` | `FLIGHT_ADMIN` |
 | `GET /api/v1/flights/schedules/:id` | `FLIGHT_ADMIN` |
@@ -556,7 +577,7 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 **Public endpoints** use the cluster-wide standard:
 ```json
 { "success": true, "message": "...", "data": {}, "meta": {}, "traceId": "..." }
-{ "success": false, "error": { "statusCode": 400, "name": "VALIDATION_ERROR", "message": "...", "details": [] }, "traceId": "..." }
+{ "success": false, "error": { "statusCode": 422, "name": "VALIDATION_ERROR", "message": "...", "details": [] }, "traceId": "..." }
 ```
 
 **Internal endpoints** (`/internal/*`) use a minimal envelope — no `data` wrapper, no `meta`, no `message` field — to reduce serialization overhead on the hot path:
@@ -579,6 +600,7 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 - `GET /api/v1/airports/:code` — get single airport detail
 - `POST /api/v1/airports` — add a new airport (SUPER_ADMIN only)
 - `PATCH /api/v1/airports/:code` — update airport details (SUPER_ADMIN only)
+- `DELETE /api/v1/airports/:code` — **soft-delete** an airport: sets `isActive = false` (SUPER_ADMIN only). Never hard-deletes — referencing schedules stay intact.
 
 ## 4.1 Airport Endpoints
 
@@ -689,7 +711,7 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 
 **Error Responses:**
 ```
-400 VALIDATION_ERROR   → Zod failed (code not 3 chars, missing fields)
+422 VALIDATION_ERROR   → Zod failed (code not 3 chars, missing fields)
 409 CONFLICT           → Airport code already exists
 ```
 
@@ -730,7 +752,7 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 
 **Error Responses:**
 ```
-400 VALIDATION_ERROR   → Zod failed
+422 VALIDATION_ERROR   → Zod failed
 404 NOT_FOUND          → Airport code does not exist
 ```
 
@@ -746,8 +768,11 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 **Operations:**
 - `GET /api/v1/aircrafts` — list all aircraft
 - `GET /api/v1/aircrafts/:id` — get single aircraft detail
-- `POST /api/v1/aircrafts` — add a new aircraft type
+- `POST /api/v1/aircrafts` — register a new physical aircraft (unique by `registration` tail number)
 - `PATCH /api/v1/aircrafts/:id` — update aircraft details (e.g., capacity correction)
+- `DELETE /api/v1/aircrafts/:id` — **soft-delete** (retire) an aircraft: sets `isActive = false` (FLIGHT_ADMIN+). Never hard-deletes — referencing schedules stay intact.
+
+**Duplicate prevention:** each aircraft is keyed by its `registration` (tail number), enforced by a DB unique constraint. A second POST with an existing registration returns **409 CONFLICT** (Prisma `P2002` → `mapPrismaError` → `ConflictError`). Registration is normalized (trim + uppercase) in Zod before it reaches the DB so `vt-abc` and `VT-ABC` are treated as the same aircraft.
 
 ## 4.2 Aircraft Endpoints
 
@@ -765,11 +790,13 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
   "data": [
     {
       "id": "a59e1981-d1c9-467b-8912-32a220b3309a",
+      "registration": "VT-IGT",
       "model": "Airbus A320",
       "totalCapacity": 180
     },
     {
       "id": "b72f2982-e2d0-578c-9023-43b331c4410b",
+      "registration": "VT-NBA",
       "model": "Boeing 737-800",
       "totalCapacity": 162
     }
@@ -793,6 +820,7 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
   "message": "Aircraft retrieved successfully.",
   "data": {
     "id": "a59e1981-d1c9-467b-8912-32a220b3309a",
+    "registration": "VT-IGT",
     "model": "Airbus A320",
     "totalCapacity": 180
   },
@@ -811,11 +839,12 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 
 **Auth required:** Yes — `FLIGHT_ADMIN` or `SUPER_ADMIN`
 
-**Validation (Zod):** `CreateAircraftSchema` — `model` 2–100 (trimmed), `totalCapacity` integer ≥ 1.
+**Validation (Zod):** `CreateAircraftSchema` — `registration` 2–10, trimmed, **uppercased**, regex `^[A-Z0-9-]+$` (`.toUpperCase()` ordered before `.regex()` so lowercase input is normalized, not rejected); `model` 2–100 (trimmed); `totalCapacity` integer, positive, ≤ 1000.
 
 **Request Body:**
 ```json
 {
+  "registration":  "VT-IGT",
   "model":         "Airbus A320",
   "totalCapacity": 180
 }
@@ -828,6 +857,7 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
   "message": "Aircraft created successfully.",
   "data": {
     "id": "a59e1981-d1c9-467b-8912-32a220b3309a",
+    "registration": "VT-IGT",
     "model": "Airbus A320",
     "totalCapacity": 180
   },
@@ -837,8 +867,8 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 
 **Error Responses:**
 ```
-400 VALIDATION_ERROR          → Zod failed
-422 BUSINESS_RULE_VIOLATION   → totalCapacity < 1
+422 VALIDATION_ERROR   → Zod failed (bad registration format, empty fields, totalCapacity ≤ 0 or > 1000)
+409 CONFLICT           → registration already exists (DB unique constraint, P2002)
 ```
 
 ---
@@ -847,7 +877,7 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 
 **Auth required:** Yes — `FLIGHT_ADMIN` or `SUPER_ADMIN`
 
-**Validation (Zod):** params `id`: UUID; body `UpdateAircraftSchema` — all fields optional (same rules as create), at least one required.
+**Validation (Zod):** params `id`: UUID; body `UpdateAircraftSchema` — all fields optional (same rules as create, including `registration` normalization), at least one required.
 
 **Request Body (all fields optional):**
 ```json
@@ -864,6 +894,7 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
   "message": "Aircraft updated successfully.",
   "data": {
     "id": "a59e1981-d1c9-467b-8912-32a220b3309a",
+    "registration": "VT-IGT",
     "model": "Airbus A320neo",
     "totalCapacity": 194
   },
@@ -873,8 +904,9 @@ All public endpoints are prefixed `/api/v1` at the Gateway level.
 
 **Error Responses:**
 ```
-400 VALIDATION_ERROR   → Zod failed
+422 VALIDATION_ERROR   → Zod failed
 404 NOT_FOUND          → Aircraft ID does not exist
+409 CONFLICT           → new registration collides with another aircraft (P2002)
 ```
 
 ---
@@ -959,7 +991,7 @@ Schedules are created via `POST /api/v1/flights/schedules` but without GET/PATCH
 
 **Error Responses:**
 ```
-400 VALIDATION_ERROR          → Zod validation failed
+422 VALIDATION_ERROR          → Zod validation failed
 404 NOT_FOUND                 → originCode, destinationCode, or aircraftId not found
 409 CONFLICT                  → Same (flightNumber, originCode, destinationCode) already exists
 422 BUSINESS_RULE_VIOLATION   → originCode === destinationCode
@@ -1101,7 +1133,7 @@ Schedules are created via `POST /api/v1/flights/schedules` but without GET/PATCH
 
 **Error Responses:**
 ```
-400 VALIDATION_ERROR   → Zod failed
+422 VALIDATION_ERROR   → Zod failed
 404 NOT_FOUND          → Schedule ID does not exist or new aircraftId not found
 ```
 
@@ -1309,7 +1341,7 @@ Cancelling a flight with confirmed bookings triggers compensating transactions. 
 
 **Error Responses:**
 ```
-400 VALIDATION_ERROR          → Zod validation failed (date format, missing inventory)
+422 VALIDATION_ERROR          → Zod validation failed (date format, missing inventory)
 404 NOT_FOUND                 → scheduleId not found
 409 CONFLICT                  → Instance already scheduled for this route on this date
 422 BUSINESS_RULE_VIOLATION   → departureDate is in the past, or arrivalDate < departureDate
@@ -1471,7 +1503,7 @@ Cancelling a flight with confirmed bookings triggers compensating transactions. 
 
 **Error Responses:**
 ```
-400 VALIDATION_ERROR   → Invalid field values, unrecognized fields, or status=CANCELLED
+422 VALIDATION_ERROR   → Invalid field values, unrecognized fields, or status=CANCELLED
                          (CANCELLED is excluded from the enum — Zod rejects it before
                           the request reaches the service; use DELETE endpoint to cancel)
 403 FORBIDDEN          → Insufficient role
@@ -1585,7 +1617,7 @@ Cancelling a flight with confirmed bookings triggers compensating transactions. 
 
 **Error Responses:**
 ```
-400 VALIDATION_ERROR          → Zod failed (negative price, invalid seats, unknown baggage keys)
+422 VALIDATION_ERROR          → Zod failed (negative price, invalid seats, unknown baggage keys)
 403 FORBIDDEN                 → inventoryId does not belong to the given instanceId
 404 NOT_FOUND                 → instanceId or inventoryId does not exist
 422 BUSINESS_RULE_VIOLATION   → availableSeats > totalSeats (checked against stored values
@@ -1832,7 +1864,7 @@ The `FOR UPDATE` lock on the `seat_holds` row (Features 9/9a) makes even *simult
 
 **Error Responses** (internal envelope):
 ```
-400 VALIDATION_ERROR     → seats invalid or required fields missing
+422 VALIDATION_ERROR     → seats invalid or required fields missing
 400 FLIGHT_NOT_ACTIVE    → Flight instance status is not SCHEDULED
 404 NOT_FOUND            → Flight instance or matching seat inventory bucket not found
 409 INSUFFICIENT_SEATS   → Not enough seats available:
@@ -1880,7 +1912,7 @@ The `FOR UPDATE` lock on the `seat_holds` row (Features 9/9a) makes even *simult
 
 **Error Responses:**
 ```
-400 VALIDATION_ERROR   → required fields missing
+422 VALIDATION_ERROR   → required fields missing
 404 HOLD_NOT_FOUND     → no seat_holds row for this bookingId
 ```
 
@@ -2015,11 +2047,14 @@ All fields optional (same rules as `CreateAirportSchema` minus `code`).
 ### CreateAircraftSchema
 | Field | Rule |
 |---|---|
+| `registration` | string, trim, **toUpperCase**, min 2, max 10, regex `^[A-Z0-9-]+$`. Order matters: `.toUpperCase()` is chained **before** `.regex()` so lowercase input is normalized rather than rejected. Unique key (DB constraint → 409). |
 | `model` | string, min 2, max 100, trim |
-| `totalCapacity` | integer, min 1 |
+| `totalCapacity` | integer, positive, max 1000 |
+
+> `CreateAircraftDTO` is `z.infer<typeof createAircraftSchema>` — the type is derived from this schema (single source of truth), not hand-written, so the two can't drift.
 
 ### UpdateAircraftSchema
-All fields optional (same rules as `CreateAircraftSchema`).
+All fields optional (same rules as `CreateAircraftSchema`), at least one required.
 
 ### CreateScheduleSchema
 | Field | Rule |
@@ -2555,8 +2590,8 @@ await prisma.airport.createMany({
 
 await prisma.aircraft.createMany({
   data: [
-    { id: 'aircraft-a320-001', model: 'Airbus A320', totalCapacity: 180 },
-    { id: 'aircraft-b737-001', model: 'Boeing 737-800', totalCapacity: 162 },
+    { id: 'aircraft-a320-001', registration: 'VT-IGT', model: 'Airbus A320', totalCapacity: 180 },
+    { id: 'aircraft-b737-001', registration: 'VT-NBA', model: 'Boeing 737-800', totalCapacity: 162 },
   ],
   skipDuplicates: true,
 });

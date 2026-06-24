@@ -1,5 +1,5 @@
 generator client {
-  provider = "prisma-client-js"
+  provider = "prisma-client"
   output   = "./generated/prisma"
 }
 
@@ -14,8 +14,24 @@ model Airport {
   city      String   @db.VarChar(100)
   country   String   @db.VarChar(100)
   timezone  String   @db.VarChar(100)
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
   @@map("airports")
 }
+
+model Aircraft {
+  id            String   @id @default(uuid())
+  model         String   @db.VarChar(100)
+  totalCapacity Int      @map("total_capacity")
+  registration  String   @unique @db.VarChar(10)
+  isActive      Boolean  @default(true) @map("is_active")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("aircrafts")
+}
+
 
 

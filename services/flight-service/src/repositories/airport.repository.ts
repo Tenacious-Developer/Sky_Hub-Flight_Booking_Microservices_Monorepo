@@ -13,7 +13,7 @@ export async function createAirport(input: CreateAirportDTO): Promise<Airport> {
 
 export async function getAllAirports(filters: ListAirportsQueryDTO): Promise<Airport[]> {
     try {
-        const where: Prisma.AirportWhereInput = {};
+        const where: Prisma.AirportWhereInput = { isActive: true }; // hide soft-deleted
 
         if (filters.country) {
             where.country = { equals: filters.country, mode: "insensitive" };
@@ -27,7 +27,9 @@ export async function getAllAirports(filters: ListAirportsQueryDTO): Promise<Air
             ];
         }
 
-        return await prisma.airport.findMany({ where, orderBy: { code: "asc" } });
+        // Reference data is small & bounded, so no full pagination — just cap the
+        // result size to keep the autocomplete payload snappy.
+        return await prisma.airport.findMany({ where, orderBy: { code: "asc" }, take: 50 });
     } catch (err) {
         throw mapPrismaError(err);
     }
@@ -35,11 +37,11 @@ export async function getAllAirports(filters: ListAirportsQueryDTO): Promise<Air
 
 export async function getAirportByCode(code: string): Promise<Airport | null> {
     try {
-        return await prisma.airport.findUnique({ where: { code } });
+        return await prisma.airport.findFirst({ where: { code, isActive: true } }); // soft-deleted → treated as not found
     } catch (err) {
         throw mapPrismaError(err);
     }
-}  
+}
 
 export async function updateAirport(code: string, data: UpdateAirportDTO): Promise<Airport> {
     try {
@@ -49,10 +51,12 @@ export async function updateAirport(code: string, data: UpdateAirportDTO): Promi
     }
 }
 
-export async function deleteAirport(code: string): Promise<void> {
+// Soft delete: flip isActive instead of removing the row, so schedules that
+// reference this airport (origin/destination) stay intact. P2025 (no such code) → 404.
+export async function deactivateAirport(code: string): Promise<void> {
     try {
-        await prisma.airport.delete({ where: { code } });
+        await prisma.airport.update({ where: { code }, data: { isActive: false } });
     } catch (err) {
-        throw mapPrismaError(err);   // P2025 → 404, P2003 (referenced by flights) → 409
+        throw mapPrismaError(err);
     }
 }

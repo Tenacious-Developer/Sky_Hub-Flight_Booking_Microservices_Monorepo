@@ -33,3 +33,5 @@ export const updateAirportSchema = createAirportSchema
     .refine((obj) => Object.keys(obj).length > 0, {
         message: "At least one field must be provided to update",
     });
+
+

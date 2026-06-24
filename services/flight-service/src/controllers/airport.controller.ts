@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
 import { created, ok, okMessage } from "@skyhub/common-utils";
-import { createAirportService, getAllAirportsService, getAirportService, updateAirportService, deleteAirportService } from "../services/airport.service";
+import { createAirportService, getAllAirportsService, getAirportService, updateAirportService, deactivateAirportService } from "../services/airport.service";
 import { CreateAirportDTO, ListAirportsQueryDTO, UpdateAirportDTO } from "../dto/airport.dto";
 
 export const createAirportHandler = async (
@@ -36,10 +36,10 @@ export const updateAirportHandler = async (
     ok(res, airport);
 };
 
-export const deleteAirportHandler = async (
+export const deactivateAirportHandler = async (
     req: Request<{ code: string }>,
     res: Response,
 ): Promise<void> => {
-    await deleteAirportService(req.params);
-    okMessage(res, "Airport deleted successfully.");
+    await deactivateAirportService(req.params);
+    okMessage(res, "Airport deactivated successfully.");
 };

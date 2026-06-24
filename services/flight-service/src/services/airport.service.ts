@@ -1,5 +1,5 @@
 import { logger, NotFoundError } from "@skyhub/common-utils";
-import { createAirport, getAllAirports, getAirportByCode, updateAirport, deleteAirport } from "../repositories/airport.repository";
+import { createAirport, getAllAirports, getAirportByCode, updateAirport, deactivateAirport } from "../repositories/airport.repository";
 import { CreateAirportDTO, AirportParamsDTO, ListAirportsQueryDTO, ResponseAirportDTO, toAirportResponse, UpdateAirportDTO } from "../dto/airport.dto";
 
 export async function createAirportService(input: CreateAirportDTO): Promise<ResponseAirportDTO> {
@@ -34,9 +34,9 @@ export async function updateAirportService(
     return toAirportResponse(airport);
 }
 
-export async function deleteAirportService(param: AirportParamsDTO): Promise<void> {
+export async function deactivateAirportService(param: AirportParamsDTO): Promise<void> {
     const code = param.code.toUpperCase();          // same normalization as get-by-code
-    await deleteAirport(code);
-    logger.info({ data: { code } }, "airport deleted");
+    await deactivateAirport(code);
+    logger.info({ data: { code } }, "airport deactivated");
 }
 
