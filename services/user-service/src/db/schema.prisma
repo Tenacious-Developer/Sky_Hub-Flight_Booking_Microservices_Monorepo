@@ -1,0 +1,11 @@
+generator client {
+  provider = "prisma-client"
+  output   = "./generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+
+// Models go here — added per feature as the build progresses (none yet).
