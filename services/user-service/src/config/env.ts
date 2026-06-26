@@ -16,6 +16,8 @@ const envSchema = z.object({
     .default("info"),
   // "*" (default) or a comma-separated list of allowed origins.
   CORS_ORIGIN: z.string().default("*"),
+  // bcrypt cost factor (§3.2). 12 ≈ 250ms/hash — slow enough to resist brute force.
+  BCRYPT_ROUNDS: z.coerce.number().int().min(10).max(15).default(12),
 });
 
 const parsed = envSchema.safeParse(process.env);

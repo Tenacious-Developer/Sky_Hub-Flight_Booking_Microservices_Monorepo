@@ -7,5 +7,48 @@ datasource db {
   provider = "postgresql"
 }
 
+model User {
+  id            String      @id @default(uuid())          // identity — UUID (anti-enumeration)
+  email         String      @unique                        // login handle; @unique → dup check = 409
+  passwordHash  String      @map("password_hash")          // the bcrypt hash (never plaintext)
+  role          AccountRole @default(CUSTOMER)             // v1 static role, set at birth
+  isActive      Boolean     @default(true)  @map("is_active")       // account state (born active)
+  emailVerified Boolean     @default(false) @map("email_verified")  // born UNverified
 
-// Models go here — added per feature as the build progresses (none yet).
+  // Email verification (OTP) — transient state, only set while a code is pending
+  emailVerifyToken     String?   @map("email_verify_token")              // SHA-256 hash of the OTP (never the raw code)
+  emailVerifyExpiresAt DateTime? @map("email_verify_expires_at")         // 10-min deadline (primary OTP defense)
+  emailVerifyAttempts  Int       @default(0) @map("email_verify_attempts") // wrong-guess counter (5 → invalidate)
+
+  createdAt     DateTime    @default(now()) @map("created_at")
+  updatedAt     DateTime    @updatedAt      @map("updated_at")
+
+
+
+  profile       UserProfile?                                // 1:1 relation
+
+  @@map("users")
+}
+
+enum AccountRole {
+  CUSTOMER
+  FLIGHT_ADMIN
+  SUPER_ADMIN
+}
+
+model UserProfile {
+  userId       String      @id @map("user_id")             // FK-as-PK → enforces 1:1
+  fullName     String      @map("full_name")
+  loyaltyTier  LoyaltyTier @default(SILVER) @map("loyalty_tier")
+  bookingCount Int         @default(0)      @map("booking_count")
+
+  user         User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_profiles")
+}
+
+enum LoyaltyTier {
+  SILVER
+  GOLD
+  PLATINUM
+}
