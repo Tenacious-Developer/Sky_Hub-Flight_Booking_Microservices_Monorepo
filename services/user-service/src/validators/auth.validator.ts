@@ -41,3 +41,11 @@ export const verifyEmailSchema = z.object({
 export const resendVerificationSchema = z.object({
   email: emailSchema,
 });
+
+// Login validates password PRESENCE only (min 1), NOT strength — the real check is
+// bcrypt.compare against the stored hash. Applying register's complexity rules here
+// would reject still-valid old passwords and leak the password policy.
+export const loginSchema = z.object({
+  email: emailSchema,
+  password: z.string().min(1, "Password is required"),
+});

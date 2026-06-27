@@ -20,6 +20,11 @@ model User {
   emailVerifyExpiresAt DateTime? @map("email_verify_expires_at")         // 10-min deadline (primary OTP defense)
   emailVerifyAttempts  Int       @default(0) @map("email_verify_attempts") // wrong-guess counter (5 → invalidate)
 
+  // Login security / lockout
+  failedLoginAttempts Int       @default(0) @map("failed_login_attempts")
+  lockedUntil         DateTime? @map("locked_until")
+  lastLoginAt         DateTime? @map("last_login_at")
+
   createdAt     DateTime    @default(now()) @map("created_at")
   updatedAt     DateTime    @updatedAt      @map("updated_at")
 

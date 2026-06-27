@@ -9,7 +9,7 @@ import {
   registerProcessHandlers,
   logger,
 } from "@skyhub/common-utils";
-import { Config, prisma } from './config/index';
+import { Config, prisma, loadKeys } from './config/index';
 import router from "./routers/index.router";
 
 async function startUserServer() {
@@ -33,10 +33,12 @@ async function startUserServer() {
   app.use(globalErrorHandler);
 
   try {
+    await loadKeys();
+    logger.info("JWT signing keys loaded");
     await prisma.$connect();
     logger.info("Database connected successfully");
   } catch (err) {
-    logger.fatal({ err }, "Database connection failed");
+    logger.fatal({ err }, "Startup failed");
     process.exit(1);
   }
 

@@ -2,4 +2,8 @@ node_modules
 # Keep environment variables out of version control
 .env
 
+# Secrets — never commit JWT signing keys
+keys/
+*.pem
+
 /src/db/generated/prisma

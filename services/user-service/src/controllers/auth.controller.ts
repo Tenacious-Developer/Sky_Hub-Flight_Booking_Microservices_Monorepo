@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
-import { created, okMessage } from "@skyhub/common-utils";
-import { registerService, verifyEmailService, resendVerificationService } from "../services/auth.service";
-import { RegisterDTO, VerifyEmailDTO, ResendVerificationDTO } from "../dto/auth.dto";
+import { ok, created, okMessage } from "@skyhub/common-utils";
+import { registerService, verifyEmailService, resendVerificationService, loginService } from "../services/auth.service";
+import { RegisterDTO, VerifyEmailDTO, ResendVerificationDTO, LoginDTO } from "../dto/auth.dto";
 
 export const registerHandler = async (
     req: Request<unknown, unknown, RegisterDTO>,
@@ -25,4 +25,12 @@ export const resendVerificationHandler = async (
 ): Promise<void> => {
     await resendVerificationService(req.body);
     okMessage(res, "If this account is unverified, a new 6-digit code has been sent.");
+};
+
+export const loginHandler = async (
+    req: Request<unknown, unknown, LoginDTO>,
+    res: Response,
+): Promise<void> => {
+    const result = await loginService(req.body);
+    ok(res, result, undefined, "Login successful");
 };

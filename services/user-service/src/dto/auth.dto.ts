@@ -1,10 +1,15 @@
 import { z } from "zod";
-import { registerSchema, verifyEmailSchema, resendVerificationSchema } from "../validators/auth.validator";
+import { registerSchema, verifyEmailSchema, resendVerificationSchema, loginSchema } from "../validators/auth.validator";
 
 // (a) what the SERVICE receives — raw request shapes derived from Zod. No Prisma.
 export type RegisterDTO = z.infer<typeof registerSchema>;
 export type VerifyEmailDTO = z.infer<typeof verifyEmailSchema>;
 export type ResendVerificationDTO = z.infer<typeof resendVerificationSchema>;
+export type LoginDTO = z.infer<typeof loginSchema>;
+
+// ORM-agnostic role union (mirrors the Prisma AccountRole enum values) — keeps the
+// DTO decoupled from Prisma. Goes into the JWT `role` claim.
+export type AccountRole = "CUSTOMER" | "FLIGHT_ADMIN" | "SUPER_ADMIN";
 
 // what findUserForVerification returns — the verify-relevant fields only (internal use).
 export type UserVerificationView = {
@@ -13,6 +18,28 @@ export type UserVerificationView = {
   emailVerifyToken: string | null;
   emailVerifyExpiresAt: Date | null;
   emailVerifyAttempts: number;
+};
+
+// what findUserForLogin returns — credential + lockout + profile fields the SERVICE
+// needs internally. ⚠️ passwordHash / lockout fields must NEVER reach the response.
+export type UserAuthView = {
+  id: string;
+  email: string;
+  passwordHash: string;
+  role: AccountRole;
+  isActive: boolean;
+  emailVerified: boolean;
+  failedLoginAttempts: number;
+  lockedUntil: Date | null;
+  fullName: string;        // from profile (for the response)
+  loyaltyTier: string;     // from profile (for the response)
+};
+
+// what the CLIENT sees on successful login — clean allowlist, NO credential/lockout.
+// refreshToken is added to `tokens` in AUTH 3 (refresh + rotation).
+export type LoginResponseDTO = {
+  user: { userId: string; email: string; fullName: string; loyaltyTier: string };
+  tokens: { accessToken: string; expiresIn: number };
 };
 
 // (a.2) what the REPOSITORY receives — post-hashing. The raw password never reaches
